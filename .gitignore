@@ -1,0 +1,9 @@
+/target
+**/.env
+nodes.json
+*.rlib
+*.log
+/tmp/
+.DS_Store
+.idea/
+.vscode/
