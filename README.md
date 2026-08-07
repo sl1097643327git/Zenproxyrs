@@ -1,6 +1,8 @@
 # Zen Proxy RS
 
-高性能 Rust 实现的 OpenAI 兼容 API 反向代理，面向 Claude Code、Hermes、OpenClaw 等客户端场景。支持代理节点池调度、协议修复、动态模型发现与可观测性管理接口。
+高性能 Rust 实现的 OpenAI 兼容 API 反向代理，面向 opencode、Claude Code 等 AI 编码客户端场景。支持代理节点池调度、协议修复、动态模型发现与可观测性管理接口。
+
+> 本项目作者使用 **opencode** 作为主要客户端（接入方式见下文）；Claude Code 接入说明为原作者所留，同样可用。
 
 本仓库为可独立部署的开源发行版，已移除内部运维文档、节点配置与密钥等敏感信息。
 
@@ -18,6 +20,13 @@
 
 ### 前置要求
 
+按部署方式选择：
+
+**Docker 部署（推荐，开箱即用）**
+- Docker 20.10+ 与 Docker Compose v2
+- 无需安装 Rust —— 镜像内自动构建
+
+**本地运行（开发/调试）**
 - Rust 1.75+（推荐 stable）
 - 可选：Redis（全局预算 / 会话 pin）
 
@@ -56,7 +65,7 @@ Docker 的**唯一功能必填项**是 `SUBSCRIBE_URL`（你的 Clash 订阅地�
 
 ```bash
 SUBSCRIBE_URL=<subscription-url>
-PROXY_API_KEY=<proxy-api-key>      # 客户端（Claude Code 等）连接用
+PROXY_API_KEY=<proxy-api-key>      # 客户端（opencode / Claude Code）连接用
 ADMIN_API_KEY=<admin-api-key>     # 管理接口 /admin/* 用
 MIHOMO_SECRET=<mihomo-secret>     # mihomo 调试口鉴权
 ```
@@ -72,14 +81,41 @@ docker compose up -d --build
 2. 两个本地混合端口（默认 `32000`/`32001`）分别绑定一组，互不影响
 3. 启动 zen-proxy-rs（clash 模式），自动发现组名并驱动节点切换
 
-#### 4. 查看状态
+#### 4. 验证部署
+
+两个容器都 `Up` 且 `zen-proxy` 为 `healthy` 即为部署成功：
 
 ```bash
 docker compose ps
+```
+
+| 容器 | 状态 | 说明 |
+|------|------|------|
+| `zenproxyrs-zen-proxy-1` | `Up ... (healthy)` | 主服务：zen-proxy-rs + mihomo |
+| `zenproxyrs-dashboard-1` | `Up ...` | Web 状态面板 |
+
+然后做一次端到端冒烟：
+
+```bash
+# 健康检查（无需鉴权）
+curl http://127.0.0.1:31000/health
+# → {"status":"ok","pools":{...},"success":true}
+
+# 模型列表（需 PROXY_API_KEY）
+curl http://127.0.0.1:31000/v1/models \
+  -H "Authorization: Bearer <proxy-api-key>"
+
+# 状态面板
+# 浏览器打开 http://<服务器>:31001
+```
+
+#### 5. 查看状态
+
+```bash
 docker compose logs -f zen-proxy
 ```
 
-#### 5. 更新
+#### 6. 更新
 
 本仓库通过 `build: .` 从源码构建，无预发布镜像。更新时拉取最新代码并重建即可：
 
@@ -94,13 +130,35 @@ docker compose up -d --build
 
 | 容器 | 宿主端口（默认） | 容器端口 | 说明 |
 |------|------------------|----------|------|
-| API | `${PORT:-31000}` | `4000` | OpenAI 兼容接口，Claude Code 接这里 |
+| API | `${PORT:-31000}` | `4000` | OpenAI 兼容接口，opencode / Claude Code 接这里 |
 | 状态面板 | `${DASH_PORT:-31001}` | `80` | Web 仪表盘（浏览器打开） |
 | mihomo 出口 1 | `${MIHOMO_PORT_1:-32000}` | `32000` | 绑定 `Group-A` |
 | mihomo 出口 2 | `${MIHOMO_PORT_2:-32001}` | `32001` | 绑定 `Group-B` |
 | mihomo API | `${MIHOMO_API_PORT:-33000}` | `33000` | 调试口，需 `MIHOMO_SECRET` |
 
-> 服务器部署：确保云安全组放行 `31000/31001/32000/32001/33000`。若仅需 Claude Code 与面板，可只放行 `31000/31001`。
+> 服务器部署：确保云安全组放行 `31000/31001/32000/32001/33000`。若仅需 opencode 与面板，可只放行 `31000/31001`。
+
+### 服务架构
+
+`docker compose up` 启动**两个服务**，缺一不可（`dashboard` 可移除但默认开启）：
+
+```text
+                  ┌─────────────────────────── docker compose ───────────────────────────┐
+   opencode ──►   │  zen-proxy (容器, build: .)                                          │
+  / Claude Code  │   ┌───────────────────┐      ┌──────────────────┐      ┌───────────┐   │
+  :31000 /v1/*   │   │   zen-proxy-rs    │ ───► │ mihomo 双出口     │ ──► │ 上游 API   │   │
+                 │   │   (节点池/熔断/    │      │ 32000 = Group-A   │      │ (OpenAI)  │   │
+                 │   │   恢复探测/管理API)│      │ 32001 = Group-B   │      └───────────┘   │
+                 │   └───────────────────┘      │ 33000 = API 调试口│                      │
+                 │                              └──────────────────┘                      │
+                 │   dashboard (容器, nginx:alpine)                                        │
+                 │   31001 → zen-proxy-dashboard.html (只读挂载)                           │
+                 └────────────────────────────────────────────────────────────────────────┘
+```
+
+- **zen-proxy 容器**：`build: .` 从源码构建 `zen-proxy-rs`，同时内置 mihomo 作为双 Clash 出口。客户端只连 `31000`，其余端口为内部出口/调试。
+- **dashboard 容器**：`nginx:alpine` 静态托管 `zen-proxy-dashboard.html`（只读挂载，更新面板需替换服务器上的 HTML 并重启该容器）。
+- 更新二进制/代码只需重建 zen-proxy：`docker compose up -d --build zen-proxy`。
 
 ## 目录结构
 
@@ -121,6 +179,7 @@ docker compose up -d --build
 |------|--------|------|
 | `PORT` | `4000` | 监听端口 |
 | `BIND_ADDRESS` | `127.0.0.1` | 绑定地址 |
+| `SUBSCRIBE_URL` | _(空)_ | Clash 订阅地址（Docker 必填）。支持 1~2 个，逗号分隔：1 个→两实例共用；2 个→实例 A 用第一个、实例 B 用第二个 |
 | `UPSTREAM_BASE` | `https://opencode.ai/zen` | 上游 API 根地址 |
 | `UPSTREAM_API_KEY` | `public` | 上游 API Key |
 | `PROXY_API_KEY` | _(空)_ | 客户端鉴权 Key，留空则不校验 |
@@ -216,6 +275,8 @@ Docker 方案无需手动配置以上任何项——entrypoint 自动生成配�
 |------|------|------|
 | GET | `/admin/runtime` | 运行状态 + Clash 快照 |
 | GET | `/admin/pool/state` | 节点池各池状态与预算 |
+| GET | `/admin/nodes/failed` | 失败节点列表（dead / 限流 / 熔断 / 内节点失效，含具体原因） |
+| POST | `/admin/clash/invalid/clear` | 清除 Clash 内部节点失效缓存 |
 | GET | `/admin/stats` | 请求统计（429/4xx/5xx） |
 | GET | `/admin/requests/recent` | 最近请求记录 |
 | GET | `/admin/clash/now` | 各 Clash 实例当前选中节点 |
@@ -270,6 +331,52 @@ curl http://<server-host>:31000/admin/runtime \
 
 浏览器打开 `http://<server-host>:31001`，右上角填 API 地址（`http://<server-host>:31000`）与 `ADMIN_API_KEY`。
 
+## 接入 AI 编码客户端
+
+### opencode（推荐，本项目作者使用）
+
+在 opencode 配置（项目根目录 `opencode.json` 或 `~/.config/opencode/opencode.json`）中注册一个自定义 provider：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "zenproxy": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Zen Proxy",
+      "options": {
+        "baseURL": "http://<server-host>:31000/v1",
+        "apiKey": "{env:ZEN_PROXY_API_KEY}"
+      },
+      "models": {
+        "deepseek-v4-flash": { "name": "DeepSeek V4 Flash" }
+      }
+    }
+  }
+}
+```
+
+- `baseURL` 指向 zen-proxy 的 OpenAI 兼容端点（`/v1` 前缀）
+- `apiKey` 通过环境变量 `ZEN_PROXY_API_KEY` 注入（值为 `.env` 中的 `PROXY_API_KEY`），避免明文写进配置
+- 启动 opencode 后选择 provider `zenproxy` + model `deepseek-v4-flash` 即可
+
+启动前导出 Key：
+
+```bash
+export ZEN_PROXY_API_KEY=<proxy-api-key>
+opencode
+```
+
+### Claude Code（原作者接入方式）
+
+```bash
+export ANTHROPIC_BASE_URL=http://<server-host>:31000
+export ANTHROPIC_AUTH_TOKEN=<proxy-api-key>
+claude
+```
+
+> 说明：作者日常使用 opencode；Claude Code 接入方式为原作者所留，仅需设置上述两个环境变量即可使用。
+
 ## 构建与测试
 
 ```bash
@@ -277,6 +384,17 @@ curl http://<server-host>:31000/admin/runtime \
 cd zen-proxy-rs
 cargo test
 ```
+
+## 故障排查
+
+| 现象 | 排查方法 |
+|------|----------|
+| `docker compose up` 后 `zen-proxy` 一直 `unhealthy` | `docker compose logs zen-proxy` 看启动报错；最常见是 `SUBSCRIBE_URL` 订阅失效导致 mihomo 拉不到节点 |
+| opencode 报连接失败 / 401 | 确认 `baseURL` 端口正确（`31000`）；`ZEN_PROXY_API_KEY` 是否与 `.env` 的 `PROXY_API_KEY` 一致；`curl http://<服务器>:31000/health` 是否通 |
+| 所有节点都 429/熔断 | 上游限流（非本代理故障）。打开面板「失败节点」卡片查看具体原因（429 限流 / 节点断网 / 上游 5xx），或 `GET /admin/nodes/failed`；可点「清除失败缓存」立即重试 |
+| 节点「内节点失效」黑名单迟迟不恢复 | `CLASH_INVALID_TTL_SECS`（默认 86400）未到期；改小该值或点「清除失败缓存」 |
+| 面板打不开 | 确认 `DASH_PORT` 未改、防火墙放行 `31001`；`docker compose ps` 看 `zenproxyrs-dashboard-1` 是否在运行 |
+| 某个订阅的节点全部失败 | 订阅本身已失效——换订阅，或按 `.env.example` 双订阅配置让两实例用不同节点池 |
 
 ## 许可证
 
