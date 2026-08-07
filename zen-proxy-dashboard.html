@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zen Proxy RS 状态面板</title>
+<style>
+:root {
+  --bg: #f6f8fa; --panel: #ffffff; --panel2: #f6f8fa;
+  --border: #d8dee4; --border-soft: #eaeef2;
+  --text: #1f2328; --muted: #57606a;
+  --accent: #0969da; --accent-hover: #0860ca;
+  --green: #1a7f37; --yellow: #9a6700; --red: #cf222e; --orange: #bc4c00;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; font-size: 14px; line-height: 1.5; }
+header { position: sticky; top: 0; z-index: 50; display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+h1 { font-size: 15px; font-weight: 600; }
+.sub { color: var(--muted); font-size: 12px; }
+.content { padding: 12px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 11.5px; font-weight: 500; line-height: 1.65; }
+.badge.ok { background: rgba(26, 127, 55, .12); color: var(--green); }
+.badge.warn { background: rgba(154, 103, 0, .12); color: var(--yellow); }
+.badge.err { background: rgba(207, 34, 46, .12); color: var(--red); }
+.badge.info { background: rgba(9, 105, 218, .10); color: var(--accent); }
+.badge.ocfault { background: rgba(176, 110, 255, .18); color: #b06eff; }
+.controls { display: flex; gap: 8px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+input[type=text], input[type=password] { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 4px; padding: 5px 9px; font-size: 13px; width: 200px; transition: border-color .15s, box-shadow .15s; }
+input[type=text]:focus, input[type=password]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(9, 105, 218, .15); }
+button { background: var(--accent); color: #fff; border: 1px solid rgba(27, 31, 36, .15); border-radius: 4px; padding: 5px 13px; font-size: 13px; cursor: pointer; }
+button:hover { background: var(--accent-hover); }
+button.ghost { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+button.ghost:hover { background: var(--panel2); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-bottom: 10px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 12px 14px; }
+.card h3 { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .4px; padding-bottom: 8px; margin-bottom: 10px; border-bottom: 1px solid var(--border-soft); }
+.card.wide { grid-column: 1 / -1; }
+.stat-row { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; }
+.stat-row:last-child { border-bottom: none; }
+.stat-row .k { color: var(--muted); }
+.stat-row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+.v.green { color: var(--green); } .v.yellow { color: var(--yellow); } .v.red { color: var(--red); } .v.orange { color: var(--orange); }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border-soft); }
+th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .3px; }
+tbody tr:nth-child(even) td { background: #fafbfc; }
+tbody tr:hover td { background: var(--panel2); }
+.node { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 8px; background: var(--panel); }
+.node:last-child { margin-bottom: 0; }
+.node .url { font-family: Consolas, "SFMono-Regular", Menlo, monospace; font-size: 12.5px; word-break: break-all; }
+.node .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.dot.dispatch { background: var(--green); } .dot.active { background: var(--accent); }
+.dot.ratelimited { background: var(--yellow); } .dot.dead { background: var(--red); }
+#toast { position: fixed; bottom: 20px; right: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 9px 14px; display: none; font-size: 13px; z-index: 99; box-shadow: 0 2px 8px rgba(0, 0, 0, .06); }
+.error-box { background: rgba(207, 34, 46, .06); border: 1px solid rgba(207, 34, 46, .3); color: var(--red); border-radius: 4px; padding: 10px 12px; margin-bottom: 10px; display: none; font-size: 13px; }
+.pill { display: inline-block; padding: 0 7px; border-radius: 3px; font-size: 11px; line-height: 1.7; background: var(--panel2); border: 1px solid var(--border); margin-right: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Zen Proxy RS 状态面板</h1>
+  <span class="sub" id="conn-status">未连接</span>
+  <div class="controls">
+    <input type="text" id="base-url" placeholder="http://127.0.0.1:4000">
+    <input type="password" id="api-key" placeholder="ADMIN_API_KEY">
+    <button onclick="saveSettings()">保存</button>
+    <button class="ghost" onclick="loadAll()">刷新</button>
+  </div>
+</header>
+
+<main class="content">
+<div class="error-box" id="error-box"></div>
+
+<div class="grid">
+  <div class="card">
+    <h3>运行概览</h3>
+    <div id="overview"></div>
+  </div>
+  <div class="card">
+    <h3>节点池</h3>
+    <div id="pools"></div>
+  </div>
+  <div class="card">
+    <h3>请求统计</h3>
+    <div id="stats"></div>
+  </div>
+  <div class="card">
+    <h3>Clash 实例</h3>
+    <div id="clash"></div>
+  </div>
+</div>
+
+<div class="card wide">
+  <h3>节点详情</h3>
+  <div id="nodes"><span class="sub">加载中…</span></div>
+</div>
+
+<div class="card wide">
+  <h3 style="display:flex;align-items:center;justify-content:space-between">失败节点 <span id="failed-count" style="font-weight:400;text-transform:none;letter-spacing:0"></span>
+    <button onclick="clearInvalidCache()" id="failed-clear-btn" style="display:none;padding:3px 10px;border-radius:6px;background:var(--danger,#e5484d);color:#fff;border:none;cursor:pointer;font-size:12px">清除失败缓存</button>
+  </h3>
+  <div id="failed-nodes"><span class="sub">加载中…</span></div>
+</div>
+
+<div class="card wide">
+  <h3>最近请求</h3>
+  <div id="requests"><span class="sub">加载中…</span></div>
+</div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+// 默认 base：跟随当前页面所在主机（服务器部署场景自动指向 31000）
+// 例: http://server:31001 打开 → 默认 http://server:31000；file:// 双击 → 127.0.0.1:4000
+function defaultBase() {
+  const host = location.hostname || '127.0.0.1';
+  if (!host || host === '' || host === 'localhost') return 'http://127.0.0.1:4000';
+  return 'http://' + host + ':31000';
+}
+let cfg = { base: defaultBase(), key: '' };
+
+document.getElementById('base-url').placeholder = defaultBase();
+document.getElementById('base-url').value = defaultBase();
+
+function saveSettings() {
+  cfg.base = document.getElementById('base-url').value.replace(/\/+$/, '');
+  cfg.key = document.getElementById('api-key').value.trim();
+  localStorage.setItem('zp_dash', JSON.stringify(cfg));
+  toast('已保存设置');
+  loadAll();
+}
+
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem('zp_dash') || '{}');
+    if (s.base) cfg.base = s.base;
+    if (s.key !== undefined) cfg.key = s.key;
+  } catch (e) {}
+  document.getElementById('base-url').value = cfg.base;
+  document.getElementById('api-key').value = cfg.key;
+}
+
+async function api(path, opts = {}) {
+  const method = opts.method || 'GET';
+  const headers = {};
+  if (cfg.key) headers['Authorization'] = 'Bearer ' + cfg.key;
+  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
+  const resp = await fetch(cfg.base + path, { method, headers, body: opts.body === undefined ? undefined : JSON.stringify(opts.body) });
+  if (resp.status === 401) throw new Error('401 未授权：请在右上角填入 ADMIN_API_KEY');
+  if (!resp.ok) throw new Error(path + ' → HTTP ' + resp.status);
+  return resp.json();
+}
+
+async function clearInvalidCache() {
+  try {
+    const d = await api('/admin/clash/invalid/clear', { method: 'POST' });
+    toast('已清除 ' + (d.data.cleared ?? 0) + ' 个失效节点');
+  } catch (e) {
+    toast('清除失败: ' + e.message);
+  }
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtDur(sec) {
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec/60) + 'm ' + (sec%60) + 's';
+  return Math.floor(sec/3600) + 'h ' + Math.floor((sec%3600)/60) + 'm';
+}
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  const u = ['B','KB','MB','GB']; let i = 0;
+  while (b >= 1024 && i < 3) { b /= 1024; i++; }
+  return b.toFixed(b < 10 && i > 0 ? 1 : 0) + ' ' + u[i];
+}
+function fmtTs(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return d.toLocaleTimeString('zh-CN', { hour12: false }) + ' ' + d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+}
+
+function poolBadge(pools) {
+  if (pools.fuse) return '<span class="badge err">熔断中</span>';
+  if (pools.dispatch > 0) return '<span class="badge ok">正常</span>';
+  if (pools.dead > 0) return '<span class="badge warn">节点全挂</span>';
+  return '<span class="badge err">无可用节点</span>';
+}
+
+function renderOverview(r) {
+  const d = r.data || r;
+  const el = document.getElementById('overview');
+  const pools = d.pools || {};
+  el.innerHTML = `
+    <div class="stat-row"><span class="k">运行状态</span><span class="v">${poolBadge(pools)}</span></div>
+    <div class="stat-row"><span class="k">运行时长</span><span class="v">${fmtDur(d.uptime_secs || 0)}</span></div>
+    <div class="stat-row"><span class="k">PID / 端口</span><span class="v">${d.pid || '—'} / ${d.port || '—'}</span></div>
+    <div class="stat-row"><span class="k">上游</span><span class="v" style="font-size:12px">${esc(d.upstream_base || '—')}</span></div>
+    <div class="stat-row"><span class="k">Provider 模式</span><span class="v">${esc(d.provider_mode || '—')}</span></div>
+    <div class="stat-row"><span class="k">节点模式</span><span class="v">${esc(d.node_provider_mode || '—')}</span></div>
+    <div class="stat-row"><span class="k">全局预算</span><span class="v">${d.global_budget?.configured ? 'Redis 已配置' : '未配置'}</span></div>
+  `;
+  document.getElementById('conn-status').textContent = '已连接 ' + cfg.base;
+  document.getElementById('conn-status').style.color = 'var(--green)';
+}
+
+function renderPools(r) {
+  const d = r.data || r;
+  const pools = d.pools || {};
+  const bars = [['dispatch', '可用', 'green'], ['active', '在用', 'accent'], ['ratelimited', '限流隔离', 'yellow'], ['dead', '故障', 'red'], ['budget_limited', '预算受限', 'orange'], ['cooldown', '冷却中', 'yellow']];
+  const total = pools.dispatch + pools.active + pools.ratelimited + pools.dead;
+  let html = `<div class="stat-row"><span class="k">节点总数</span><span class="v">${total}</span></div>`;
+  html += `<div class="stat-row"><span class="k">熔断开关</span><span class="v">${pools.fuse ? '<span class="badge err">ON</span>' : '<span class="badge ok">OFF</span>'}</span></div>`;
+  for (const [k, label, color] of bars) {
+    const v = pools[k] || 0;
+    const pct = total ? (v / total * 100) : 0;
+    html += `<div class="stat-row"><span class="k">${label}</span><span class="v ${color}">${v}${total ? ` <span style="font-size:11px;color:var(--muted)">${pct.toFixed(0)}%</span>` : ''}</span></div>`;
+  }
+  document.getElementById('pools').innerHTML = html;
+}
+
+function renderStats(r) {
+  const s = (r.data && r.data.stats) || r.data || {};
+  const rows = [
+    ['总请求', s.total_requests || 0, ''],
+    ['成功', s.success || 0, 'green'],
+    ['429 限流', s.count_429 || 0, s.count_429 ? 'red' : ''],
+    ['4xx', s.count_4xx || 0, s.count_4xx ? 'yellow' : ''],
+    ['5xx', s.count_5xx || 0, s.count_5xx ? 'red' : ''],
+    ['RPM', (s.rpm || 0).toFixed(1), ''],
+    ['平均延迟', (s.avg_latency_ms || 0) + ' ms', s.avg_latency_ms > 5000 ? 'orange' : ''],
+    ['流量', fmtBytes(s.bytes_sent || 0) + ' ↑ / ' + fmtBytes(s.bytes_received || 0) + ' ↓', ''],
+  ];
+  document.getElementById('stats').innerHTML = rows.map(([k, v, c]) =>
+    `<div class="stat-row"><span class="k">${k}</span><span class="v ${c}">${v}</span></div>`).join('');
+}
+
+function renderClash(r) {
+  const d = r.data || r;
+  const clash = d.mode ? d : (d.clash || null);
+  const el = document.getElementById('clash');
+  if (!clash || clash.mode !== 'clash') { el.innerHTML = '<span class="sub">非 clash 模式（webshare/直连）</span>'; return; }
+  const mode = clash.mode || '';
+  if (!clash.instances || !clash.instances.length) { el.innerHTML = '<span class="sub">无 Clash 实例</span>'; return; }
+  el.innerHTML = `<div style="display:flex;align-items:center;gap:8px;justify-content:space-between;margin-bottom:8px"><div class="sub">模式: <span class="pill">${esc(mode)}</span></div></div>` +
+    clash.instances.map((inst, i) => {
+      const ok = !!inst.available;
+      const stBadge = `<span class="badge ${ok ? 'ok' : 'err'}">${ok ? '可用' : '故障'}</span>`;
+      const st = inst.state ? `<span class="pill">${esc(inst.state)}</span>` : '';
+      const cur = inst.current_node ? esc(inst.current_node) : '<span style="color:var(--muted)">—</span>';
+      return `<div class="node">
+        <div>
+          <div><span class="dot ${ok ? 'active' : 'err'}"></span><b>实例 ${i + 1}</b> ${stBadge} ${st}</div>
+          <div class="meta">端口: <span style="font-family:Consolas,monospace">${esc(inst.proxy_url || '—')}</span></div>
+          <div class="meta">当前节点: <b style="color:var(--accent)">${cur}</b></div>
+        </div>
+      </div>`;
+    }).join('');
+}
+
+function stateBadge(state) {
+  const map = {
+    dispatch: ['ok', '可用'],
+    active: ['info', '在用'],
+    ratelimited: ['warn', '限流隔离'],
+    dead: ['err', '故障'],
+    budget_limited: ['warn', '预算受限'],
+    cooldown: ['warn', '冷却中'],
+    leased: ['info', '租借中'],
+  };
+  const [cls, label] = map[state] || ['info', state || '?'];
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+function renderNodes(r) {
+  const d = r.data || r;
+  const budget = d.budget || [];
+  const el = document.getElementById('nodes');
+  if (!budget.length) { el.innerHTML = '<span class="sub">暂无节点</span>'; return; }
+  el.innerHTML = budget.map(n => {
+    const lb = n.local_budget || {};
+    const cd = lb.cooldown_until ? new Date(lb.cooldown_until) : null;
+    const now = new Date();
+    const cdTxt = cd ? (cd > now ? fmtDur(Math.round((cd - now) / 1000)) : '已过期') : '—';
+    return `<div class="node">
+      <div style="flex:1">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${stateBadge(n.state)}
+          <span style="font-family:Consolas,monospace;font-size:12.5px">${esc(n.node_url_redacted || n.node_id || '—')}</span>
+        </div>
+        <div class="meta" style="display:flex;gap:14px;flex-wrap:wrap;margin-top:5px">
+          <span>分数 <b>${typeof n.score === 'number' ? n.score.toFixed(3) : '—'}</b></span>
+          <span>成功率 <b>${typeof n.recent_success_rate === 'number' ? (n.recent_success_rate * 100).toFixed(0) + '%' : '—'}</b></span>
+          <span>延迟 <b>${n.avg_latency_ms != null ? n.avg_latency_ms + ' ms' : '—'}</b></span>
+          <span>连续成功 <b>${n.consecutive_successes ?? '—'}</b></span>
+          <span>闲置 <b>${n.idle_secs != null ? fmtDur(n.idle_secs) : '—'}</b></span>
+        </div>
+        <div class="meta" style="margin-top:3px">
+          窗口: 调用 <b>${lb.calls_in_window ?? '—'}</b> / ${lb.max_concurrent ?? '—'} 并发 · Token <b>${lb.tokens_in_window ?? '—'}</b> · KB <b>${lb.kb_in_window ?? '—'}</b>
+          ${lb.budget_hit_reason ? ` · <span style="color:var(--orange)">触顶: ${esc(lb.budget_hit_reason)}</span>` : ''}
+          ${lb.cooldown_until ? ` · 冷却剩余 <span style="color:var(--yellow)">${cdTxt}</span>` : ''}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// 失败原因（后端机器可读 label）→ 中文展示
+function reasonCn(r) {
+  switch (r) {
+    case 'rate_limited': return '429 限流';
+    case 'upstream_error': return '上游 5xx 错误';
+    case 'network_error': return '节点断网/连接失败';
+    case 'timeout': return '探测超时';
+    case 'other': return '其他错误';
+    default: return r || '未知';
+  }
+}
+
+function renderFailedNodes(r) {
+  const list = (r.data && r.data.nodes) || r.data || [];
+  const el = document.getElementById('failed-nodes');
+  const cnt = document.getElementById('failed-count');
+  const btn = document.getElementById('failed-clear-btn');
+  if (!list.length) {
+    cnt.textContent = '';
+    if (btn) btn.style.display = 'none';
+    el.innerHTML = '<span class="v green">✓ 无失败节点</span>';
+    return;
+  }
+  cnt.innerHTML = `<span class="badge err">${list.length}</span>`;
+  if (btn) btn.style.display = 'inline-block';
+  el.innerHTML = list.map(n => {
+    const isDead = n.state === 'dead';
+    const isCooling = n.state === 'cooling';
+    const isClashInvalid = n.state === 'clash_invalid';
+    const stBadge = isDead
+      ? '<span class="badge err">故障</span>'
+      : isCooling
+        ? '<span class="badge warn">熔断冷却</span>'
+        : isClashInvalid
+          ? '<span class="badge warn">内节点失效</span>'
+          : '<span class="badge warn">限流隔离</span>';
+    let details;
+    if (isDead) {
+      const lastProbe = n.last_probe_secs != null ? fmtDur(n.last_probe_secs) + ' 前' : '—';
+      details = `
+        <span>原因 <b>${esc(reasonCn(n.reason || 'hard_error'))}</b></span>
+        <span>累计故障 <b>${n.dead_count ?? '—'}</b> 次</span>
+        <span>已隔离 <b>${fmtDur(n.dead_age_secs || 0)}</b></span>
+        <span>最近探测 <b>${lastProbe}</b></span>
+        <span>连续成功 <b>${n.consecutive_probe_successes ?? '—'}</b></span>`;
+    } else if (isCooling) {
+      details = `
+        <span>原因 <b>上游连续 5xx</b></span>
+        <span>剩余冷却 <b>${fmtDur(n.cooldown_secs || 0)}</b></span>
+        <span>探测恢复中…</span>`;
+    } else if (isClashInvalid) {
+      details = `
+        <span>所属实例 <b>${esc(n.instance || '—')}</b></span>
+        <span>内部节点 <b>${esc(n.node || '—')}</b></span>
+        <span>剩余黑名单 <b>${fmtDur(n.ttl_secs || 0)}</b></span>
+        <span>原因 <b>${esc(reasonCn(n.reason))}</b></span>`;
+    } else {
+      details = `
+        <span>原因 <b>429</b></span>
+        <span>最近 429 <b>${fmtTs(n.last_429_date)}</b></span>
+        <span>连续天数 <b>${n.consecutive_days ?? '—'}</b></span>`;
+    }
+    return `<div class="node">
+      <div style="flex:1">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${stBadge}
+          <span style="font-family:Consolas,monospace;font-size:12.5px">${esc(n.url || n.node_id || '—')}</span>
+        </div>
+        <div class="meta" style="display:flex;gap:14px;flex-wrap:wrap;margin-top:5px">${details}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function failureBadge(q) {
+  const status = q.status || 0;
+  const kind = q.failure_kind || '';
+  const msg = q.failure_message || '';
+  const title = (kind ? 'kind: ' + kind : '') + (msg ? (kind ? ' · ' : '') + 'msg: ' + msg : '');
+  const t = title ? ` title="${esc(title)}"` : '';
+  if (status >= 500 || kind === 'upstream_5xx') {
+    return `<span class="badge ocfault"${t}>OC 官方故障</span>`;
+  }
+  if (status === 429 || kind === 'rate_limited') {
+    return `<span class="badge warn"${t}>节点限流</span>`;
+  }
+  if (kind) {
+    return `<span class="badge err"${t}>${esc(kind)}</span>`;
+  }
+  return '<span class="v green">✓</span>';
+}
+
+function renderRequests(r) {
+  const list = (r.data || []);
+  const el = document.getElementById('requests');
+  if (!list.length) { el.innerHTML = '<span class="sub">暂无请求记录</span>'; return; }
+  let html = `<table><thead><tr><th>时间</th><th>状态</th><th>模型</th><th>节点</th><th>延迟</th><th>池</th><th>失败原因</th></tr></thead><tbody>`;
+  for (const q of list) {
+    const status = q.status || 0;
+    const cls = status >= 500 ? 'red' : status === 429 ? 'yellow' : status >= 400 ? 'orange' : 'green';
+    html += `<tr>
+      <td>${fmtTs(q.ts)}</td>
+      <td><span class="v ${cls}">${status}</span></td>
+      <td>${esc(q.model || '—')}</td>
+      <td style="font-family:Consolas,monospace;font-size:11.5px">${esc(q.node_url || '—')}</td>
+      <td class="v">${q.latency_total_ms ? q.latency_total_ms + ' ms' : '—'}</td>
+      <td>${esc(q.pool || '—')}</td>
+      <td>${failureBadge(q)}</td>
+    </tr>`;
+  }
+  el.innerHTML = html + '</tbody></table>';
+}
+
+function showError(msg) {
+  const box = document.getElementById('error-box');
+  box.style.display = 'block';
+  box.textContent = msg;
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(() => t.style.display = 'none', 2500);
+}
+
+async function loadAll() {
+  document.getElementById('error-box').style.display = 'none';
+  try {
+    const [rt, pools, stats, reqs, clashNow, failed] = await Promise.all([
+      api('/admin/runtime'),
+      api('/admin/pool/state'),
+      api('/admin/stats'),
+      api('/admin/requests/recent?limit=30'),
+      api('/admin/clash/now'),
+      api('/admin/nodes/failed'),
+    ]);
+    renderOverview(rt);
+    renderPools(pools);
+    renderStats(stats);
+    renderClash(clashNow);
+    renderNodes(pools);
+    renderFailedNodes(failed);
+    renderRequests(reqs);
+  } catch (e) {
+    showError('加载失败: ' + e.message);
+    document.getElementById('conn-status').textContent = '连接失败';
+    document.getElementById('conn-status').style.color = 'var(--red)';
+  }
+}
+
+loadSettings();
+loadAll();
+setInterval(loadAll, 3000);
+</script>
+</body>
+</html>

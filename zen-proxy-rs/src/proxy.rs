@@ -291,6 +291,97 @@ pub async fn proxy_handler(
                 "proxy FAIL"
             );
 
+            // Record the failure so failed requests are visible on the
+            // dashboard (previously only successes were recorded).
+            let failure_kind = if status == 429 {
+                "rate_limited".to_string()
+            } else if status >= 500 {
+                "upstream_5xx".to_string()
+            } else {
+                "upstream_error".to_string()
+            };
+            let failure_message = match status {
+                999 => "no proxy resources available".to_string(),
+                998 => "circuit open: upstream rate limit detected".to_string(),
+                _ => format!("upstream error {status}"),
+            };
+            let tele = RequestTelemetry {
+                rid: uuid::Uuid::new_v4().to_string(),
+                ts: chrono::Utc::now().timestamp_millis(),
+                external_request_id: external_request_id.clone(),
+                gateway: gateway.clone(),
+                gateway_channel_id: headers
+                    .get("x-newapi-channel-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string(),
+                run_id: String::new(),
+                source_platform: String::new(),
+                case_id: String::new(),
+                runner_model: String::new(),
+                provider_id: String::new(),
+                turn_index: 0,
+                model: model.to_string(),
+                public_model: model.to_string(),
+                upstream_model: model.to_string(),
+                protocol: if path == "messages" {
+                    "anthropic_messages".to_string()
+                } else {
+                    "openai_chat_completions".to_string()
+                },
+                client_id: client_id.clone(),
+                path: path.clone(),
+                method: method.to_string(),
+                is_streaming: streaming,
+                node_url: String::new(),
+                selected_node_id: String::new(),
+                selected_node_url_redacted: String::new(),
+                observed_exit_ip: String::new(),
+                outcome: "error".to_string(),
+                pool: String::new(),
+                exit_ip: String::new(),
+                status,
+                rate_limited: status == 429,
+                retry_count: 0,
+                latency_total_ms: elapsed,
+                upstream_ms: 0,
+                ttft_ms: 0,
+                timings: crate::collector::RequestTimings {
+                    total_ms: elapsed,
+                    ..crate::collector::RequestTimings::default()
+                },
+                affinity_key: String::new(),
+                affinity_hit: false,
+                affinity_node_id: String::new(),
+                body_size_bucket: body_size_bucket(body_len).to_string(),
+                protocol_guard: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                cached_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_miss_input_tokens: 0,
+                session_id: String::new(),
+                usk: String::new(),
+                icp_scope: String::new(),
+                prefix_32k_hash: String::new(),
+                cache_forensics: None,
+                prefix_drift: false,
+                session_pin_hit: false,
+                thinking_policy: String::new(),
+                prompt_cache_key: String::new(),
+                provider_cache_observation: String::new(),
+                warmup_state: String::new(),
+                bytes_sent: body_len,
+                bytes_received: 0,
+                failure_kind,
+                failure_message,
+                retry_chain: Vec::new(),
+                context: None,
+            };
+            state.collector.record_request(&tele);
+
             let (status_code, error_code, message): (StatusCode, i64, String) = match status {
                 999 => (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -558,9 +649,15 @@ async fn proxy_with_retry(
                         attempt,
                     });
                 } else {
+                    // 5xx is an upstream (opencode.ai) outage, NOT a bad exit
+                    // node. Report as SoftFailure so the node is simply released
+                    // (no dead-pool quarantine, no recovery probe that could
+                    // mark the current internal clash node invalid). The next
+                    // request keeps trying the same node - an official outage is
+                    // transient and should not blacklist clash internals.
                     state.pool_manager.report(
                         node_id.clone(),
-                        crate::pool::ResultKind::Error {
+                        crate::pool::ResultKind::SoftFailure {
                             kind: ErrorKind::Upstream5xx,
                         },
                         latency,

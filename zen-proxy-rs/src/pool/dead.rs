@@ -138,4 +138,23 @@ impl DeadPool for DeadPoolImpl {
             .get(node_id)
             .map(|e| e.node.clone())
     }
+
+    fn failure_snapshot(&self) -> Vec<serde_json::Value> {
+        let entries = self.entries.read().unwrap();
+        entries
+            .iter()
+            .map(|(id, entry)| {
+                serde_json::json!({
+                    "node_id": id.clone(),
+                    "url": crate::ledger::LedgerEvent::redact_node_url(&entry.node.url),
+                    "state": "dead",
+                    "reason": "hard_error",
+                    "dead_count": entry.dead_count,
+                    "dead_age_secs": entry.entered_at.elapsed().as_secs(),
+                    "last_probe_secs": entry.last_probe_at.map(|t| t.elapsed().as_secs()),
+                    "consecutive_probe_successes": entry.consecutive_probe_successes,
+                })
+            })
+            .collect()
+    }
 }

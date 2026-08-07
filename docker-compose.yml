@@ -2,25 +2,44 @@ services:
   zen-proxy:
     build: .
     ports:
-      - "${PORT:-4000}:4000"
-    env_file:
-      - .env
+      - "${PORT:-31000}:4000"          # zen-proxy-rs API 网页 (Claude Code 接这里)
+      - "${MIHOMO_PORT_1:-32000}:${MIHOMO_PORT_1:-32000}"  # mihomo 出口 1 (Group-A)
+      - "${MIHOMO_PORT_2:-32001}:${MIHOMO_PORT_2:-32001}"  # mihomo 出口 2 (Group-B)
+      - "${MIHOMO_API_PORT:-33000}:${MIHOMO_API_PORT:-33000}"  # mihomo API 调试口 (需 MIHOMO_SECRET)
+    environment:
+      # 必填: 你的 Clash 订阅地址。支持 1 或 2 个订阅(逗号分隔):
+      #   1 个 -> 两个 mihomo 实例都用它; 2 个 -> 实例A(端口1)用第一个, 实例B(端口2)用第二个
+      - SUBSCRIBE_URL=${SUBSCRIBE_URL:?SUBSCRIBE_URL is required — put your Clash subscription link in .env}
+      # zen-proxy-rs 监听 (容器内固定 4000, 宿主端口用 PORT 变量映射)
+      - PORT=4000
+      - BIND_ADDRESS=0.0.0.0
+      # mihomo 出口/API 端口与分组名(默认即可, 通常无需改)
+      - MIHOMO_PORT_1=${MIHOMO_PORT_1:-32000}
+      - MIHOMO_PORT_2=${MIHOMO_PORT_2:-32001}
+      - MIHOMO_API_PORT=${MIHOMO_API_PORT:-33000}
+      - MIHOMO_SECRET=${MIHOMO_SECRET:-zen-proxy-secret}
+      - GROUP_A=${GROUP_A:-Group-A}
+      - GROUP_B=${GROUP_B:-Group-B}
+      # 上游 (默认 opencode.ai/zen)
+      - UPSTREAM_BASE=${UPSTREAM_BASE:-https://opencode.ai/zen}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-public}
+      # 模型列表: 开启后 /v1/models 显示静态注册表全部模型(含 big-pickle/mimo-v2.5/hy3)
+      - V4_MODEL_REGISTRY_ENABLED=${V4_MODEL_REGISTRY_ENABLED:-false}
+      # 客户端鉴权 (Claude Code 用 PROXY_API_KEY 连接; 生产必须设置!)
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
     restart: unless-stopped
-    volumes:
-      - zen-proxy-data:/tmp
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:4000/health"]
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:4000/health"]  # 容器内固定 4000
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 25s
 
-  # Optional Redis for global budget / session affinity
-  # redis:
-  #   image: redis:7-alpine
-  #   ports:
-  #     - "6379:6379"
-  #   restart: unless-stopped
-
-volumes:
-  zen-proxy-data:
+  dashboard:
+    image: nginx:alpine
+    ports:
+      - "${DASH_PORT:-31001}:80"   # Zen Proxy 状态面板 (浏览器打开)
+    volumes:
+      - ./zen-proxy-dashboard.html:/usr/share/nginx/html/index.html:ro
+    restart: unless-stopped

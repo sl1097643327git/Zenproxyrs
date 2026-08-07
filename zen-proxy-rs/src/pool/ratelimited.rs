@@ -136,4 +136,21 @@ impl RateLimitedPool for RateLimitedPoolImpl {
             .get(node_id)
             .map(|e| e.node.clone())
     }
+
+    fn failure_snapshot(&self) -> Vec<serde_json::Value> {
+        let entries = self.entries.read().unwrap();
+        entries
+            .iter()
+            .map(|(id, entry)| {
+                serde_json::json!({
+                    "node_id": id.clone(),
+                    "url": crate::ledger::LedgerEvent::redact_node_url(&entry.node.url),
+                    "state": "ratelimited",
+                    "reason": "429",
+                    "last_429_date": entry.last_429_date,
+                    "consecutive_days": entry.consecutive_days,
+                })
+            })
+            .collect()
+    }
 }

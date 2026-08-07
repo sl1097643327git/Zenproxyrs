@@ -37,6 +37,48 @@ impl FromStr for ProviderMode {
     }
 }
 
+/// Where the proxy-node pool gets its exit nodes from.
+///
+/// - `WebShare`: nodes come from `NODES_FILE` / `PREFERRED_PROXY_URLS` and are
+///   treated as static proxies (the original behavior). A failed node stays
+///   dead until a probe succeeds from the same URL.
+/// - `Clash`: nodes are local Clash/mihomo mixed-ports (`CLASH_PROXY_URLS`)
+///   and are driven by each Clash instance's external-controller REST API.
+///   When a node is rate-limited or errors, the coordinator asks its Clash to
+///   switch to a different *internal* node (new exit IP) before re-probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeProviderMode {
+    WebShare,
+    Clash,
+}
+
+impl NodeProviderMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WebShare => "webshare",
+            Self::Clash => "clash",
+        }
+    }
+}
+
+impl fmt::Display for NodeProviderMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NodeProviderMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "webshare" | "web-share" => Ok(Self::WebShare),
+            "clash" => Ok(Self::Clash),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicModelPublicMode {
     StaticOnly,
@@ -351,6 +393,14 @@ pub struct Config {
     pub global_backoff_cooldown_secs: u64,
     pub nodes_file: String,
     pub preferred_proxy_urls: Vec<String>,
+    pub node_provider_mode: NodeProviderMode,
+    pub clash_api_urls: Vec<String>,
+    pub clash_api_secrets: Vec<String>,
+    pub clash_proxy_urls: Vec<String>,
+    pub clash_group_names: Vec<String>,
+    pub clash_config_file: Option<String>,
+    pub clash_switch_max_attempts: u32,
+    pub clash_invalid_ttl_secs: u64,
     pub ledger_events_path: String,
     pub audit_log_enabled: bool,
     pub audit_log_dir: String,
@@ -388,6 +438,10 @@ pub struct Config {
     pub node_max_kb_per_window: u64,
     pub node_budget_cooldown_secs: i64,
     pub node_budget_window_secs: u64,
+    pub node_5xx_break_threshold: u32,
+    pub node_5xx_break_cooldown_secs: i64,
+    pub node_5xx_probe_interval_ms: u64,
+    pub node_5xx_probe_successes: u32,
     pub node_lease_ttl_secs: u64,
     pub global_budget_redis_url: Option<String>,
     pub instance_id: String,
@@ -484,6 +538,37 @@ impl Config {
             nodes_file: env::var("NODES_FILE")
                 .unwrap_or_else(|_| "/etc/zen-proxy/nodes.json".into()),
             preferred_proxy_urls: parse_proxy_list_env("PREFERRED_PROXY_URLS"),
+            node_provider_mode: load_env_var("NODE_PROVIDER_MODE", NodeProviderMode::WebShare),
+            clash_api_urls: parse_csv_list_env("CLASH_API_URLS"),
+            clash_api_secrets: parse_csv_list_env("CLASH_API_SECRETS"),
+            clash_proxy_urls: parse_proxy_list_env("CLASH_PROXY_URLS"),
+            // CLASH_GROUP_NAMES is a comma-separated list aligned by index with
+            // CLASH_API_URLS/CLASH_PROXY_URLS (each Clash instance may drive a
+            // *different* Selector group). Falls back to legacy CLASH_GROUP_NAME
+            // (single value) when the list is empty.
+            clash_group_names: {
+                let names = parse_csv_list_env("CLASH_GROUP_NAMES");
+                if !names.is_empty() {
+                    names
+                } else if let Ok(single) = env::var("CLASH_GROUP_NAME") {
+                    if single.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![single.trim().to_string()]
+                    }
+                } else {
+                    // Empty means "auto-discover": main.rs resolves groups from
+                    // CLASH_CONFIG_FILE listeners (by port) or from the Clash
+                    // APIs, falling back to "Proxy" only when discovery fails.
+                    Vec::new()
+                }
+            },
+            clash_switch_max_attempts: load_env_var("CLASH_SWITCH_MAX_ATTEMPTS", 15u32),
+            clash_invalid_ttl_secs: load_env_var("CLASH_INVALID_TTL_SECS", 86400u64),
+            clash_config_file: match env::var("CLASH_CONFIG_FILE") {
+                Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+                _ => None,
+            },
             proxy_api_key: match env::var("PROXY_API_KEY") {
                 Ok(v) if !v.is_empty() => Some(v),
                 _ => None,
@@ -619,6 +704,10 @@ impl Config {
             node_max_kb_per_window: load_env_var("NODE_MAX_KB_PER_WINDOW", 64 * 1024u64),
             node_budget_cooldown_secs: load_env_var("NODE_BUDGET_COOLDOWN_SECS", 60i64),
             node_budget_window_secs: load_env_var("NODE_BUDGET_WINDOW_SECS", 3600u64),
+            node_5xx_break_threshold: load_env_var("NODE_5XX_BREAK_THRESHOLD", 10u32),
+            node_5xx_break_cooldown_secs: load_env_var("NODE_5XX_BREAK_COOLDOWN_SECS", 60i64),
+            node_5xx_probe_interval_ms: load_env_var("NODE_5XX_PROBE_INTERVAL_MS", 1000u64),
+            node_5xx_probe_successes: load_env_var("NODE_5XX_PROBE_SUCCESSES", 2u32),
             node_lease_ttl_secs: load_env_var("NODE_LEASE_TTL_SECS", 180u64),
             global_budget_redis_url: match env::var("GLOBAL_BUDGET_REDIS_URL") {
                 Ok(v) if !v.is_empty() => Some(v),
@@ -713,7 +802,11 @@ impl Config {
         );
         m.insert("big-pickle".to_string(), "big-pickle".to_string());
         m.insert("mimo-v2.5".to_string(), "mimo-v2.5-free".to_string());
-        m.insert("hy3".to_string(), "hy3-free".to_string());
+        m.insert("north-mini-code".to_string(), "north-mini-code-free".to_string());
+        m.insert("ling-3.0-flash".to_string(), "ling-3.0-flash-free".to_string());
+        m.insert("laguna-s-2.1".to_string(), "laguna-s-2.1-free".to_string());
+        m.insert("longcat-2.0".to_string(), "longcat-2.0-free".to_string());
+        m.insert("nemotron-3-ultra".to_string(), "nemotron-3-ultra-free".to_string());
         m
     }
 
@@ -758,6 +851,19 @@ impl Config {
     }
 
     pub fn load_nodes(&self) -> Vec<String> {
+        if self.node_provider_mode == NodeProviderMode::Clash {
+            let nodes = self.clash_proxy_urls.clone();
+            if !nodes.is_empty() {
+                tracing::info!(
+                    count = nodes.len(),
+                    "clash mode: loaded proxy nodes from CLASH_PROXY_URLS"
+                );
+                return dedupe_preserving_order(nodes);
+            }
+            tracing::warn!(
+                "clash mode enabled but CLASH_PROXY_URLS is empty; falling back to legacy node sources"
+            );
+        }
         let mut nodes = self.preferred_proxy_urls.clone();
         let file_nodes = match std::fs::read_to_string(&self.nodes_file) {
             Ok(contents) => match parse_nodes_file(&contents) {
@@ -927,6 +1033,7 @@ mod tests {
             "OPENCODE_SESSION_TTL_SECS",
             "ZEN_PROVIDER_MODE",
             "FREE_MODEL_TRUE_FIRST_TOKEN_FRT",
+            "CLASH_SWITCH_MAX_ATTEMPTS",
             "V4_MODEL_REGISTRY_ENABLED",
             "DYNAMIC_MODEL_DISCOVERY_ENABLED",
             "DYNAMIC_MODEL_DISCOVERY_URL",
@@ -961,6 +1068,10 @@ mod tests {
             "NODE_MAX_KB_PER_WINDOW",
             "NODE_BUDGET_COOLDOWN_SECS",
             "NODE_BUDGET_WINDOW_SECS",
+            "NODE_5XX_BREAK_THRESHOLD",
+            "NODE_5XX_BREAK_COOLDOWN_SECS",
+            "NODE_5XX_PROBE_INTERVAL_MS",
+            "NODE_5XX_PROBE_SUCCESSES",
             "NODE_LEASE_TTL_SECS",
             "GLOBAL_BUDGET_REDIS_URL",
             "INSTANCE_ID",
@@ -1013,6 +1124,7 @@ mod tests {
         assert_eq!(cfg.probe_timeout_secs, 30);
         assert!(cfg.preferred_proxy_urls.is_empty());
         assert_eq!(cfg.probe_batch_size, 5);
+        assert_eq!(cfg.clash_switch_max_attempts, 15);
         assert_eq!(cfg.dispatch_capacity, 100);
         assert_eq!(cfg.ledger_events_path, "/tmp/zen-proxy-ledger-events.jsonl");
         assert!(cfg.audit_log_enabled);
@@ -1064,6 +1176,10 @@ mod tests {
         assert_eq!(cfg.node_max_kb_per_window, 64 * 1024);
         assert_eq!(cfg.node_budget_cooldown_secs, 60);
         assert_eq!(cfg.node_budget_window_secs, 3600);
+        assert_eq!(cfg.node_5xx_break_threshold, 10);
+        assert_eq!(cfg.node_5xx_break_cooldown_secs, 60);
+        assert_eq!(cfg.node_5xx_probe_interval_ms, 1000);
+        assert_eq!(cfg.node_5xx_probe_successes, 2);
         assert_eq!(cfg.node_lease_ttl_secs, 180);
         assert!(cfg.global_budget_redis_url.is_none());
         assert!(cfg.instance_id.starts_with("zen-"));
@@ -1126,6 +1242,7 @@ mod tests {
     fn from_env_reads_env_overrides() {
         let _guard = env_lock();
         unsafe { env::set_var("PORT", "8080") };
+        unsafe { env::set_var("CLASH_SWITCH_MAX_ATTEMPTS", "7") };
         unsafe { env::set_var("LOG_LEVEL", "debug") };
         unsafe { env::set_var("PREFERRED_PROXY_URLS", "http://127.0.0.1:7897,1.2.3.4:8080") };
         unsafe { env::set_var("PROBE_BATCH_SIZE", "10") };
@@ -1174,6 +1291,10 @@ mod tests {
         unsafe { env::set_var("NODE_MAX_KB_PER_WINDOW", "77") };
         unsafe { env::set_var("NODE_BUDGET_COOLDOWN_SECS", "17") };
         unsafe { env::set_var("NODE_BUDGET_WINDOW_SECS", "1700") };
+        unsafe { env::set_var("NODE_5XX_BREAK_THRESHOLD", "5") };
+        unsafe { env::set_var("NODE_5XX_BREAK_COOLDOWN_SECS", "33") };
+        unsafe { env::set_var("NODE_5XX_PROBE_INTERVAL_MS", "777") };
+        unsafe { env::set_var("NODE_5XX_PROBE_SUCCESSES", "3") };
         unsafe { env::set_var("NODE_LEASE_TTL_SECS", "270") };
         unsafe { env::set_var("GLOBAL_BUDGET_REDIS_URL", "redis://127.0.0.1:6379/") };
         unsafe { env::set_var("INSTANCE_ID", "test-instance") };
@@ -1239,6 +1360,7 @@ mod tests {
             ]
         );
         assert_eq!(cfg.probe_batch_size, 10);
+        assert_eq!(cfg.clash_switch_max_attempts, 7);
         assert!(cfg.opencode_headers_enabled);
         assert_eq!(cfg.opencode_client_name, "desktop-cli");
         assert_eq!(cfg.zen_provider_mode, ProviderMode::FreeModelKernel);
@@ -1290,6 +1412,10 @@ mod tests {
         assert_eq!(cfg.node_max_kb_per_window, 77);
         assert_eq!(cfg.node_budget_cooldown_secs, 17);
         assert_eq!(cfg.node_budget_window_secs, 1700);
+        assert_eq!(cfg.node_5xx_break_threshold, 5);
+        assert_eq!(cfg.node_5xx_break_cooldown_secs, 33);
+        assert_eq!(cfg.node_5xx_probe_interval_ms, 777);
+        assert_eq!(cfg.node_5xx_probe_successes, 3);
         assert_eq!(cfg.node_lease_ttl_secs, 270);
         assert_eq!(
             cfg.global_budget_redis_url.as_deref(),
@@ -1352,6 +1478,7 @@ mod tests {
 
         remove_env_vars(&[
             "PORT",
+            "CLASH_SWITCH_MAX_ATTEMPTS",
             "LOG_LEVEL",
             "PREFERRED_PROXY_URLS",
             "PROBE_BATCH_SIZE",
@@ -1390,6 +1517,10 @@ mod tests {
             "NODE_MAX_KB_PER_WINDOW",
             "NODE_BUDGET_COOLDOWN_SECS",
             "NODE_BUDGET_WINDOW_SECS",
+            "NODE_5XX_BREAK_THRESHOLD",
+            "NODE_5XX_BREAK_COOLDOWN_SECS",
+            "NODE_5XX_PROBE_INTERVAL_MS",
+            "NODE_5XX_PROBE_SUCCESSES",
             "NODE_LEASE_TTL_SECS",
             "GLOBAL_BUDGET_REDIS_URL",
             "INSTANCE_ID",
@@ -1486,8 +1617,27 @@ mod tests {
             cfg.model_mapping.get("mimo-v2.5").unwrap(),
             "mimo-v2.5-free"
         );
-        assert_eq!(cfg.model_mapping.get("hy3").unwrap(), "hy3-free");
-        assert_eq!(cfg.model_mapping.len(), 4);
+        assert_eq!(
+            cfg.model_mapping.get("north-mini-code").unwrap(),
+            "north-mini-code-free"
+        );
+        assert_eq!(
+            cfg.model_mapping.get("ling-3.0-flash").unwrap(),
+            "ling-3.0-flash-free"
+        );
+        assert_eq!(
+            cfg.model_mapping.get("laguna-s-2.1").unwrap(),
+            "laguna-s-2.1-free"
+        );
+        assert_eq!(
+            cfg.model_mapping.get("longcat-2.0").unwrap(),
+            "longcat-2.0-free"
+        );
+        assert_eq!(
+            cfg.model_mapping.get("nemotron-3-ultra").unwrap(),
+            "nemotron-3-ultra-free"
+        );
+        assert_eq!(cfg.model_mapping.len(), 8);
     }
 
     #[test]

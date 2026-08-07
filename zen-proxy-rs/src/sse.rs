@@ -2,6 +2,10 @@ use std::collections::VecDeque;
 
 pub struct SseBuffer {
     buf: VecDeque<u8>,
+    /// 跨 `push_bytes` 调用保留的未完成行（前一个 chunk 末尾没遇到换行的字节）。
+    /// 此前是 `push_bytes` 的局部变量，导致每个 chunk 边界都会丢失行首字节，
+    /// 产生无 `data:` 前缀的裸行碎片（且真实数据被静默丢弃）。
+    pending_line: Vec<u8>,
     done: bool,
 }
 
@@ -9,6 +13,7 @@ impl SseBuffer {
     pub fn new() -> Self {
         Self {
             buf: VecDeque::new(),
+            pending_line: Vec::new(),
             done: false,
         }
     }
@@ -22,7 +27,8 @@ impl SseBuffer {
             self.buf.push_back(b);
         }
         let mut lines: Vec<Vec<u8>> = Vec::new();
-        let mut current_line: Vec<u8> = Vec::new();
+        // 从头一个 chunk 保留的未完成行继续累积，避免跨 chunk 丢字节。
+        let mut current_line: Vec<u8> = std::mem::take(&mut self.pending_line);
         while let Some(&b) = self.buf.front() {
             if b == b'\n' || b == b'\r' {
                 let _ = self.buf.pop_front();
@@ -52,6 +58,8 @@ impl SseBuffer {
                 let _ = self.buf.pop_front();
             }
         }
+        // 未遇到换行的剩余字节保留到下一次调用继续累积。
+        self.pending_line = current_line;
         lines
     }
 }
@@ -94,13 +102,20 @@ fn patch_sse_line(line: &[u8]) -> Vec<u8> {
                             let content = delta_obj.get("content").and_then(|v| v.as_str());
                             let reasoning =
                                 delta_obj.get("reasoning_content").and_then(|v| v.as_str());
-                            if let Some(rc) = reasoning {
-                                if !rc.is_empty() && content.is_none_or(|c| c.is_empty()) {
-                                    delta_obj.insert(
-                                        "content".to_string(),
-                                        serde_json::Value::String(rc.to_string()),
-                                    );
-                                }
+                            let has_reasoning = reasoning.is_some_and(|r| !r.is_empty());
+                            let has_content = content.is_some_and(|c| !c.is_empty());
+                            if has_reasoning && !has_content {
+                                // 推理阶段：content 显式置 null，让下游知道正文尚未开始。
+                                delta_obj.insert(
+                                    "content".to_string(),
+                                    serde_json::Value::Null,
+                                );
+                            } else if has_content && !has_reasoning {
+                                // 回答阶段：reasoning_content 显式置 null。
+                                delta_obj.insert(
+                                    "reasoning_content".to_string(),
+                                    serde_json::Value::Null,
+                                );
                             }
                         }
                     }
@@ -146,14 +161,34 @@ mod tests {
     }
 
     #[test]
-    fn patches_reasoning_to_content() {
+    fn reasoning_phase_nullifies_content() {
+        // 推理阶段：reasoning_content 非空、content 空 → content 应显式置 null，
+        // 而不是被复制成与 reasoning_content 同值的字符串。
         let mut buf = SseBuffer::new();
-        let json = r#"data: {"choices":[{"index":0,"delta":{"content":null,"reasoning_content":"hello"}}]}"#;
+        let json = r#"data: {"choices":[{"index":0,"delta":{"content":null,"reasoning_content":"思考中"}}]}"#;
         let result = buf.push_bytes(format!("{}\n\n", json).as_bytes());
         let all: Vec<u8> = result.iter().flatten().copied().collect();
         let s = String::from_utf8_lossy(&all);
-        assert!(s.contains("\"content\":\"hello\""));
-        assert!(!s.contains("\"content\":null"));
+        assert!(s.contains("\"reasoning_content\":\"思考中\""));
+        assert!(s.contains("\"content\":null"));
+        // 不再把 reasoning 复制进 content，二者不得同值。
+        assert!(!s.contains("\"content\":\"思考中\""));
+        let reasoning_count = s.matches("\"reasoning_content\":\"思考中\"").count();
+        let content_value_count = s.matches("\"content\":\"思考中\"").count();
+        assert_eq!(reasoning_count, 1);
+        assert_eq!(content_value_count, 0);
+    }
+
+    #[test]
+    fn answer_phase_nullifies_reasoning() {
+        // 回答阶段：content 非空、reasoning_content 空 → reasoning_content 应显式置 null。
+        let mut buf = SseBuffer::new();
+        let json = r#"data: {"choices":[{"index":0,"delta":{"content":"正文","reasoning_content":null}}]}"#;
+        let result = buf.push_bytes(format!("{}\n\n", json).as_bytes());
+        let all: Vec<u8> = result.iter().flatten().copied().collect();
+        let s = String::from_utf8_lossy(&all);
+        assert!(s.contains("\"content\":\"正文\""));
+        assert!(s.contains("\"reasoning_content\":null"));
     }
 
     #[test]
@@ -168,6 +203,38 @@ mod tests {
         let all: Vec<u8> = result.iter().flatten().copied().collect();
         let s = String::from_utf8_lossy(&all);
         assert!(s.contains("content"));
+    }
+
+    #[test]
+    fn no_bare_lines_across_chunk_boundaries() {
+        // 回归测试：旧 bug 的 current_line 是局部变量，每个 chunk 末尾未完成行
+        // 被丢弃，导致下一个 chunk 从行中间开始，输出无 `data:` 前缀的裸行碎片。
+        // 用小 chunk 刻意把事件切断在 JSON 中间。
+        let event1 = r#"data: {"choices":[{"index":0,"delta":{"content":"第一段"}}]}"#;
+        let event2 = r#"data: {"choices":[{"index":0,"delta":{"content":"第二段"}}]}"#;
+        let stream = format!("{}\n\n{}\n\ndata: [DONE]\n\n", event1, event2);
+        let bytes: Vec<u8> = stream.into_bytes();
+        let mut buf = SseBuffer::new();
+        let mut all: Vec<u8> = Vec::new();
+        let step = 7;
+        let mut i = 0;
+        while i < bytes.len() {
+            let end = (i + step).min(bytes.len());
+            for line in buf.push_bytes(&bytes[i..end]) {
+                all.extend_from_slice(&line);
+            }
+            i = end;
+        }
+        let s = String::from_utf8_lossy(&all);
+        for l in s.split('\n') {
+            if l.is_empty() || l.starts_with("data") {
+                continue;
+            }
+            panic!("bare line leaked through chunk boundary: {:?}", l);
+        }
+        // 两个事件的内容都必须完整保留（跨 chunk 不能丢字节）。
+        assert!(s.contains("\"content\":\"第一段\""), "event 1 content missing");
+        assert!(s.contains("\"content\":\"第二段\""), "event 2 content missing");
     }
 
     #[test]

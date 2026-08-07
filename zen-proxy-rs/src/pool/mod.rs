@@ -175,6 +175,22 @@ pub trait Pool: Send + Sync {
     fn add(&self, node: NodeRef);
     fn available(&self) -> usize;
     fn name(&self) -> &'static str;
+
+    /// 当前处于 5xx 熔断冷却的节点（node_id, url, 冷却截止时间）。
+    fn five_xx_break_candidates(&self) -> Vec<(NodeId, String, Option<i64>)> {
+        Vec::new()
+    }
+
+    /// 探测线程回报 5xx 熔断节点探测结果；返回 true 表示已恢复（解除熔断）。
+    fn record_five_xx_probe(&self, node_id: &NodeId, success: bool, required: u32) -> bool {
+        let _ = (node_id, success, required);
+        false
+    }
+
+    /// 5xx 熔断恢复所需的连续成功探测次数（从池配置读取）。
+    fn five_xx_probe_successes(&self) -> u32 {
+        2
+    }
 }
 
 pub trait PoolManager: Send + Sync {
@@ -192,6 +208,10 @@ pub trait PoolManager: Send + Sync {
     fn pool_stats(&self) -> PoolStats;
     fn budget_details(&self) -> Vec<serde_json::Value>;
     fn node_budget_detail(&self, node_id: &str) -> Option<serde_json::Value>;
+    /// Aggregated snapshot of failed/quarantined (dead + ratelimited) nodes.
+    fn failed_nodes(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
     fn fuse_all(&self);
     fn unfuse_all(&self);
     fn add_node(&self, url: &str);
@@ -200,8 +220,26 @@ pub trait PoolManager: Send + Sync {
     fn recover_node(&self, node_id: &str);
     fn probe_all(&self);
     fn probe_dead_adaptive(&self);
+    /// Re-probe rate-limited (429-quarantined) nodes. In clash mode each
+    /// attempt rotates the instance to a fresh internal node first.
+    fn probe_ratelimited_adaptive(&self) {}
+    /// Re-probe 5xx circuit-breaked nodes; recovers on consecutive successes.
+    fn probe_five_xx_adaptive(&self) {}
     fn runtime_details(&self) -> serde_json::Value {
         serde_json::json!({})
+    }
+    /// Clash provider state snapshot (empty JSON when not in clash mode).
+    fn clash_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    /// Clash coordinator handle (None when not in clash mode).
+    fn clash_coordinator(&self) -> Option<std::sync::Arc<crate::provider::clash::ClashCoordinator>> {
+        None
+    }
+    /// Per-Clash-instance availability (proxy_url -> node pool state).
+    /// Empty when not in clash mode.
+    fn clash_instances_state(&self) -> serde_json::Value {
+        serde_json::json!({ "mode": "webshare", "instances": [] })
     }
 }
 
@@ -212,6 +250,10 @@ pub trait RateLimitedPool: Pool {
     fn recover(&self, node_id: &NodeId);
     fn quarantined_today(&self) -> usize;
     fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef>;
+    /// Snapshot of quarantined (429) nodes for the failed-node list.
+    fn failure_snapshot(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
 }
 
 pub trait DeadPool: Pool {
@@ -223,6 +265,10 @@ pub trait DeadPool: Pool {
     fn recover(&self, node_id: &NodeId);
     fn dead_count(&self, node_id: &NodeId) -> u32;
     fn get_node_ref(&self, node_id: &NodeId) -> Option<NodeRef>;
+    /// Snapshot of dead nodes for the failed-node list.
+    fn failure_snapshot(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
 }
 
 pub trait NodeProvider: Send + Sync {

@@ -1,0 +1,18 @@
+# Build artifacts (huge on Windows hosts)
+target/
+**/target/
+
+# Secrets & local config
+.env
+nodes.json
+*.local
+
+# VCS / editor
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# OS junk
+Thumbs.db
+Desktop.ini

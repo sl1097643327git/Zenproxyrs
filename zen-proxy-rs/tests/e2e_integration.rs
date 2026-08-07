@@ -520,7 +520,7 @@ mod e2e {
             .collect();
         assert_eq!(
             ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "north-mini-code", "ling-3.0-flash", "laguna-s-2.1", "longcat-2.0", "nemotron-3-ultra"]
         );
 
         let detail = reqwest::blocking::get(format!(
@@ -571,7 +571,7 @@ mod e2e {
                 .collect();
             assert_eq!(
                 probe_ids,
-                vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"],
+                vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "north-mini-code", "ling-3.0-flash", "laguna-s-2.1", "longcat-2.0", "nemotron-3-ultra"],
                 "{probe_name} model probe ids"
             );
         }
@@ -612,7 +612,7 @@ mod e2e {
             .collect();
         assert_eq!(
             public_ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "north-mini-code", "ling-3.0-flash", "laguna-s-2.1", "longcat-2.0", "nemotron-3-ultra"]
         );
 
         let client = reqwest::blocking::Client::new();
@@ -792,7 +792,7 @@ mod e2e {
             .collect();
         assert_eq!(
             before_ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "north-mini-code", "ling-3.0-flash", "laguna-s-2.1", "longcat-2.0", "nemotron-3-ultra"]
         );
 
         let promoted = client
@@ -826,7 +826,11 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-opencode"
             ]
         );
@@ -912,7 +916,11 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-candidate-direct",
                 "second-candidate-direct"
             ]
@@ -1021,7 +1029,10 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
                 "nemotron-3-ultra"
             ]
         );
@@ -1035,7 +1046,7 @@ mod e2e {
         let hidden_body: serde_json::Value = hidden_detail.json().unwrap();
         assert_eq!(hidden_body["id"], "north-mini-code");
         assert_eq!(hidden_body["upstream_id"], "north-mini-code-free");
-        assert_eq!(hidden_body["profile"], "dynamic_generic");
+        assert_eq!(hidden_body["profile"], "static_flash");
 
         stop_server(child, port);
     }
@@ -1210,7 +1221,11 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-manual-harness"
             ]
         );
@@ -1294,7 +1309,11 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-harness-probed"
             ]
         );
@@ -1463,7 +1482,11 @@ mod e2e {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-http-probed"
             ]
         );
@@ -1747,7 +1770,7 @@ mod e2e {
             .collect();
         assert_eq!(
             public_ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "north-mini-code", "ling-3.0-flash", "laguna-s-2.1", "longcat-2.0", "nemotron-3-ultra"]
         );
 
         stop_server(child, port);
@@ -2279,7 +2302,7 @@ mod e2e {
             .collect();
         assert_eq!(
             ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "north-mini-code", "ling-3.0-flash", "laguna-s-2.1", "longcat-2.0", "nemotron-3-ultra"]
         );
         stop_server(child, port);
     }
@@ -2936,7 +2959,7 @@ mod e2e {
             .collect();
         assert_eq!(
             v4_ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "north-mini-code", "ling-3.0-flash", "laguna-s-2.1", "longcat-2.0", "nemotron-3-ultra"]
         );
         stop_server(v4_child, v4_port);
     }

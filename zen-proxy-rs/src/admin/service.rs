@@ -287,6 +287,8 @@ impl AdminService {
             "bind_address": cfg.bind_address,
             "port": cfg.port,
             "provider_mode": cfg.zen_provider_mode.to_string(),
+            "node_provider_mode": cfg.node_provider_mode.to_string(),
+            "clash": state.pool_manager.clash_snapshot(),
             "v4_model_registry_active": cfg.v4_model_registry_active(),
             "upstream_base": sanitize_text(&cfg.upstream_base),
             "allow_direct_fallback": cfg.allow_direct_fallback,
@@ -934,6 +936,10 @@ impl AdminService {
                 "fuse": p.fuse,
             }
         }))
+    }
+    pub fn failed_nodes(state: &AppState) -> Response {
+        let failed = state.pool_manager.failed_nodes();
+        Self::ok_response(json!({ "nodes": failed }))
     }
     pub fn pool_by_name(state: &AppState, name: &str) -> Response {
         let p = state.pool_manager.pool_stats();
@@ -1593,6 +1599,34 @@ impl AdminService {
     pub fn probe_now(state: &AppState) -> Response {
         state.pool_manager.probe_all();
         Self::ok_status()
+    }
+    /// Live query of each Clash instance's currently selected internal node
+    /// and availability (read-only; never triggers a switch). Refreshes the
+    /// coordinator's cached selections first (async), then reads the
+    /// synchronous per-instance state.
+    pub async fn clash_now(state: &AppState) -> Response {
+        let Some(coord) = state.pool_manager.clash_coordinator() else {
+            return Self::ok_response(json!({ "mode": "webshare", "instances": [] }));
+        };
+        coord.refresh_current_nodes().await;
+        Self::ok_response(state.pool_manager.clash_instances_state())
+    }
+
+    /// Clear the invalid-node blacklist for every Clash instance. Stale invalid
+    /// entries (TTL 86400s by default) can leave only a single candidate node,
+    /// so this flushes them to allow full retry of the internal node set.
+    pub fn clash_invalid_clear(state: &AppState) -> Response {
+        let Some(coord) = state.pool_manager.clash_coordinator() else {
+            return Self::ok_response(json!({ "mode": "webshare", "cleared": 0, "instances": 0 }));
+        };
+        let cleared = coord.clear_all_invalid();
+        let instances = coord.instance_count();
+        Self::ok_response(json!({
+            "mode": "clash",
+            "cleared": cleared,
+            "instances": instances,
+            "ts": chrono::Utc::now().timestamp_millis()
+        }))
     }
 }
 

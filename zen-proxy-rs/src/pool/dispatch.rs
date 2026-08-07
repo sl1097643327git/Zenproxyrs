@@ -14,6 +14,11 @@ const DEFAULT_MAX_CALLS_PER_WINDOW: u64 = 100;
 const DEFAULT_MAX_TOKENS_PER_WINDOW: u64 = 10_000_000;
 const DEFAULT_MAX_KB_PER_WINDOW: u64 = 64 * 1024;
 const DEFAULT_COOLDOWN_SECS: i64 = 60;
+const DEFAULT_WINDOW_SECS: u64 = 3600;
+const DEFAULT_5XX_BREAK_THRESHOLD: u32 = 10;
+const DEFAULT_5XX_BREAK_COOLDOWN_SECS: i64 = 60;
+const DEFAULT_5XX_PROBE_SUCCESSES: u32 = 2;
+const FIVE_XX_BREAK_REASON: &str = "upstream_5xx_break";
 const DEFAULT_DISPATCH_SHARDS: usize = 16;
 const BUCKET_COUNT: usize = 5;
 const TOKEN_BUCKET_COUNT: usize = 5;
@@ -56,6 +61,10 @@ pub struct NodeBudgetLimits {
     pub max_tokens_per_window: u64,
     pub max_kb_per_window: u64,
     pub cooldown_secs: i64,
+    pub window_secs: u64,
+    pub five_xx_break_threshold: u32,
+    pub five_xx_break_cooldown_secs: i64,
+    pub five_xx_probe_successes: u32,
 }
 
 impl Default for NodeBudgetLimits {
@@ -65,6 +74,10 @@ impl Default for NodeBudgetLimits {
             max_tokens_per_window: DEFAULT_MAX_TOKENS_PER_WINDOW,
             max_kb_per_window: DEFAULT_MAX_KB_PER_WINDOW,
             cooldown_secs: DEFAULT_COOLDOWN_SECS,
+            window_secs: DEFAULT_WINDOW_SECS,
+            five_xx_break_threshold: DEFAULT_5XX_BREAK_THRESHOLD,
+            five_xx_break_cooldown_secs: DEFAULT_5XX_BREAK_COOLDOWN_SECS,
+            five_xx_probe_successes: DEFAULT_5XX_PROBE_SUCCESSES,
         }
     }
 }
@@ -91,6 +104,9 @@ struct NodeBudget {
     max_tokens_per_window: u64,
     max_kb_per_window: u64,
     cooldown_secs: i64,
+    window_secs: u64,
+    five_xx_break_secs: i64,
+    window_start: i64,
     cooldown_until: Option<i64>,
     budget_hit_reason: Option<String>,
 }
@@ -105,6 +121,9 @@ impl From<NodeBudgetLimits> for NodeBudget {
             max_tokens_per_window: limits.max_tokens_per_window,
             max_kb_per_window: limits.max_kb_per_window,
             cooldown_secs: limits.cooldown_secs,
+            window_secs: limits.window_secs.max(1),
+            five_xx_break_secs: limits.five_xx_break_cooldown_secs,
+            window_start: chrono::Utc::now().timestamp(),
             cooldown_until: None,
             budget_hit_reason: None,
         }
@@ -165,11 +184,44 @@ impl NodeBudget {
         self.budget_hit_reason = Some(reason.into());
     }
 
+    /// 5xx 熔断冷却：与预算冷却共享 cooldown_until 槽位，
+    /// 但使用独立的熔断时长与 reason 标记。
+    fn cooldown_five_xx(&mut self, now: i64) {
+        self.cooldown_until = Some(now + self.five_xx_break_secs);
+        self.budget_hit_reason = Some(FIVE_XX_BREAK_REASON.to_string());
+    }
+
+    /// 探测恢复成功时立即解除冷却（无需等待过期）。
+    fn clear_cooldown(&mut self) {
+        self.cooldown_until = None;
+        self.budget_hit_reason = None;
+    }
+
     fn clear_expired_cooldown(&mut self, now: i64) {
         if self.cooldown_until.is_some_and(|until| until <= now) {
             self.cooldown_until = None;
             self.budget_hit_reason = None;
         }
+    }
+
+    /// Sliding window: when the current window has elapsed, reset the
+    /// per-window counters so a full budget never becomes a permanent lock.
+    fn slide_window(&mut self, now: i64) {
+        if now.saturating_sub(self.window_start) >= self.window_secs as i64 {
+            self.calls_in_window = 0;
+            self.tokens_in_window = 0;
+            self.kb_in_window = 0;
+            self.window_start = now;
+        }
+    }
+
+    /// Roll back tokens/kb for a failed request (5xx/429/error) so upstream
+    /// failures do not burn the node's window budget. Calls still count once.
+    fn rollback_failure(&mut self, meta: &RequestMeta) {
+        self.tokens_in_window = self
+            .tokens_in_window
+            .saturating_sub(meta.estimated_input_tokens());
+        self.kb_in_window = self.kb_in_window.saturating_sub(meta.request_kb());
     }
 }
 
@@ -186,6 +238,8 @@ struct PoolNode {
     idle_since: AtomicI64,
     max_concurrent: AtomicU32,
     active_leases: AtomicU32,
+    consecutive_five_xx: AtomicU32,
+    five_xx_probe_successes: AtomicU32,
     active_requests: RwLock<VecDeque<RequestMeta>>,
     budget: RwLock<NodeBudget>,
 }
@@ -208,6 +262,8 @@ impl PoolNode {
                 aimd.max_concurrent.max(aimd.min_concurrent.max(1)),
             )),
             active_leases: AtomicU32::new(0),
+            consecutive_five_xx: AtomicU32::new(0),
+            five_xx_probe_successes: AtomicU32::new(0),
             active_requests: RwLock::new(VecDeque::new()),
             budget: RwLock::new(NodeBudget::from(limits)),
         }
@@ -299,6 +355,56 @@ impl PoolNode {
             self.lower_base_score();
             self.reduce_concurrency(aimd);
         }
+    }
+
+    /// 记录一次连续 5xx。达到阈值时触发熔断（复用 budget 冷却槽位，
+    /// 后续 can_admit 自动拒绝 dispatch）。返回是否本次触发了熔断。
+    fn record_five_xx_failure(&self, threshold: u32, now: i64) -> bool {
+        if threshold == 0 {
+            return false;
+        }
+        let count = self.consecutive_five_xx.fetch_add(1, Ordering::Relaxed) + 1;
+        if count >= threshold {
+            self.budget.write().unwrap().cooldown_five_xx(now);
+            self.consecutive_five_xx.store(0, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// 任何非 5xx 结果（含成功）清零连续计数——保证「连续」语义，
+    /// 断断续续的 5xx 不会触发熔断。
+    fn reset_five_xx_counter(&self) {
+        self.consecutive_five_xx.store(0, Ordering::Relaxed);
+    }
+
+    /// 探测线程回报探测结果：成功则累计，达到 required 次数立即解除熔断；
+    /// 失败则清零探测连续计数（熔断保持）。
+    fn record_five_xx_probe(&self, success: bool, required: u32, now: i64) -> bool {
+        if success {
+            let count = self.five_xx_probe_successes.fetch_add(1, Ordering::Relaxed) + 1;
+            if required > 0 && count >= required {
+                self.budget.write().unwrap().clear_cooldown();
+                self.five_xx_probe_successes.store(0, Ordering::Relaxed);
+                return true;
+            }
+        } else {
+            self.five_xx_probe_successes.store(0, Ordering::Relaxed);
+            // 探测失败：续期熔断，避免冷却在探测成功前自然过期
+            if self.budget.read().unwrap().cooldown_until.is_some() {
+                self.budget.write().unwrap().cooldown_five_xx(now);
+            }
+        }
+        false
+    }
+
+    fn is_five_xx_break_active(&self, now: i64) -> bool {
+        self.budget.read().unwrap().cooldown_until.is_some_and(|until| until > now)
+            && self.budget.read().unwrap().budget_hit_reason.as_deref() == Some(FIVE_XX_BREAK_REASON)
+    }
+
+    fn five_xx_break_until(&self) -> Option<i64> {
+        self.budget.read().unwrap().cooldown_until
     }
 
     fn record_latency(&self, latency_ms: u64) {
@@ -443,6 +549,7 @@ impl PoolNode {
         let max_concurrent = self.max_concurrent.load(Ordering::Relaxed);
         let mut budget = self.budget.write().unwrap();
         budget.clear_expired_cooldown(now);
+        budget.slide_window(now);
         match budget.can_admit(meta, now, concurrent_now, max_concurrent) {
             Ok(()) => {
                 budget.admit(meta);
@@ -652,6 +759,43 @@ impl DispatchPool {
             .map(|snapshot| snapshot.concurrent_now as usize)
             .sum();
         (cooldown_size, budget_limited_size, leased_count)
+    }
+
+    /// 返回当前处于 5xx 熔断冷却中的节点（node_id, node_url, 冷却截止时间）。
+    /// 供后台探测线程枚举要探测的上游节点。
+    pub fn five_xx_break_candidates(&self) -> Vec<(NodeId, String, Option<i64>)> {
+        let now = chrono::Utc::now().timestamp();
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let nodes = shard.nodes.read().unwrap();
+            for pn in nodes.iter() {
+                if pn.is_five_xx_break_active(now) {
+                    out.push((
+                        pn.node.id.clone(),
+                        pn.node.url.clone(),
+                        pn.five_xx_break_until(),
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// 探测线程回报单个节点探测结果。success=true 且连续达 required 次则解除熔断，
+    /// 返回 true 表示已恢复。success=false（或未达阈值）返回 false。
+    pub fn record_five_xx_probe(
+        &self,
+        node_id: &NodeId,
+        success: bool,
+        required_counts: u32,
+    ) -> bool {
+        let shard_idx = self.shard_index_for_id(node_id);
+        let mut nodes = self.shards[shard_idx].nodes.write().unwrap();
+        if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {
+            let now = chrono::Utc::now().timestamp();
+            return pn.record_five_xx_probe(success, required_counts, now);
+        }
+        false
     }
 
     fn global_admit(&self, node: &PoolNode, meta: &RequestMeta) -> bool {
@@ -961,14 +1105,15 @@ impl Pool for DispatchPool {
         let mut nodes = self.shards[shard_idx].nodes.write().unwrap();
         if let Some(pn) = nodes.iter_mut().find(|n| n.node.id == *node_id) {
             pn.release_lease();
-            if let Some(meta) = pn.take_admitted_meta() {
+            let admitted = pn.take_admitted_meta();
+            if let Some(meta) = admitted.as_ref() {
                 if matches!(result, ResultKind::ClientGone) {
                     if let Some(registry) = &self.global_budget {
                         registry.release_one(node_id);
                     }
                     return;
                 }
-                pn.record_completion_latency_for_meta(&meta, latency_ms);
+                pn.record_completion_latency_for_meta(meta, latency_ms);
             }
             if let Some(registry) = &self.global_budget {
                 registry.release_one(node_id);
@@ -976,21 +1121,48 @@ impl Pool for DispatchPool {
             match result {
                 ResultKind::Success(_) => {
                     pn.record_result(true, latency_ms, &self.aimd);
+                    pn.reset_five_xx_counter();
                     pn.idle_since
                         .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
                 }
                 ResultKind::RateLimited => {
                     pn.record_result(false, latency_ms, &self.aimd);
+                    if let Some(meta) = admitted.as_ref() {
+                        pn.budget.write().unwrap().rollback_failure(meta);
+                    }
                 }
                 ResultKind::EmptyOutput => {
                     pn.record_result(false, latency_ms, &self.aimd);
+                    if let Some(meta) = admitted.as_ref() {
+                        pn.budget.write().unwrap().rollback_failure(meta);
+                    }
                 }
                 ResultKind::ClientGone => {}
-                ResultKind::SoftFailure { .. } => {
+                ResultKind::SoftFailure { kind } => {
                     pn.record_result(false, latency_ms, &self.aimd);
+                    if let Some(meta) = admitted.as_ref() {
+                        pn.budget.write().unwrap().rollback_failure(meta);
+                    }
+                    if matches!(kind, crate::pool::ErrorKind::Upstream5xx) {
+                        let threshold = self.budget_limits.five_xx_break_threshold;
+                        let now = chrono::Utc::now().timestamp();
+                        if pn.record_five_xx_failure(threshold, now) {
+                            tracing::warn!(
+                                node_id = %node_id,
+                                consecutive = threshold,
+                                "5xx 连续达到阈值，触发上游熔断冷却"
+                            );
+                        }
+                    } else {
+                        // 其他软失败（空输出等）不算 5xx，清零连续计数
+                        pn.reset_five_xx_counter();
+                    }
                 }
                 ResultKind::Error { .. } => {
                     pn.record_result(false, latency_ms, &self.aimd);
+                    if let Some(meta) = admitted.as_ref() {
+                        pn.budget.write().unwrap().rollback_failure(meta);
+                    }
                 }
             }
         }
@@ -1090,6 +1262,18 @@ impl Pool for DispatchPool {
 
     fn name(&self) -> &'static str {
         "dispatch"
+    }
+
+    fn five_xx_break_candidates(&self) -> Vec<(NodeId, String, Option<i64>)> {
+        DispatchPool::five_xx_break_candidates(self)
+    }
+
+    fn record_five_xx_probe(&self, node_id: &NodeId, success: bool, required: u32) -> bool {
+        DispatchPool::record_five_xx_probe(self, node_id, success, required)
+    }
+
+    fn five_xx_probe_successes(&self) -> u32 {
+        self.budget_limits.five_xx_probe_successes
     }
 }
 
@@ -1462,5 +1646,118 @@ mod tests {
             assert_eq!(snapshot.node_state, "dispatch");
             assert_eq!(snapshot.budget_hit_reason, None);
         }
+    }
+
+    #[test]
+    fn five_xx_contiguous_failures_trigger_circuit_break() {
+        // threshold 3: 3 contiguous 5xx soft-failures must move node to cooldown.
+        let pool = DispatchPool::new_with_limits(NodeBudgetLimits {
+            five_xx_break_threshold: 3,
+            five_xx_break_cooldown_secs: 60,
+            ..NodeBudgetLimits::default()
+        });
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:1085".to_string(),
+        ));
+        let node_id = pool.budget_snapshots()[0].node_id.clone();
+
+        // 2 failures: still dispatchable.
+        for _ in 0..2 {
+            pool.release(
+                &node_id,
+                &ResultKind::SoftFailure {
+                    kind: crate::pool::ErrorKind::Upstream5xx,
+                },
+            );
+        }
+        assert_eq!(pool.budget_snapshots()[0].node_state, "dispatch");
+
+        // 3rd failure: breaks (cooldown).
+        pool.release(
+            &node_id,
+            &ResultKind::SoftFailure {
+                kind: crate::pool::ErrorKind::Upstream5xx,
+            },
+        );
+        assert_eq!(pool.budget_snapshots()[0].node_state, "cooldown");
+        assert_eq!(
+            pool.budget_snapshots()[0].budget_hit_reason.as_deref(),
+            Some("upstream_5xx_break")
+        );
+        // Node is no longer acquirable.
+        assert!(pool.acquire_for(&meta(100)).is_none());
+    }
+
+    #[test]
+    fn five_xx_success_resets_contiguous_counter() {
+        // A success between two failure bursts must reset the count, so a
+        // stuttering upstream never trips the breaker.
+        let pool = DispatchPool::new_with_limits(NodeBudgetLimits {
+            five_xx_break_threshold: 3,
+            ..NodeBudgetLimits::default()
+        });
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:1086".to_string(),
+        ));
+        let node_id = pool.budget_snapshots()[0].node_id.clone();
+
+        for _ in 0..2 {
+            pool.release(
+                &node_id,
+                &ResultKind::SoftFailure {
+                    kind: crate::pool::ErrorKind::Upstream5xx,
+                },
+            );
+        }
+        // Interleave a success: must clear the counter.
+        pool.release(&node_id, &ResultKind::Success(200));
+        pool.release(
+            &node_id,
+            &ResultKind::SoftFailure {
+                kind: crate::pool::ErrorKind::Upstream5xx,
+            },
+        );
+        pool.release(
+            &node_id,
+            &ResultKind::SoftFailure {
+                kind: crate::pool::ErrorKind::Upstream5xx,
+            },
+        );
+        // Total 4 Avail failures but only 2 contiguous after the success.
+        assert_eq!(pool.budget_snapshots()[0].node_state, "dispatch");
+    }
+
+    #[test]
+    fn five_xx_break_lifts_after_consecutive_probe_successes() {
+        let pool = DispatchPool::new_with_limits(NodeBudgetLimits {
+            five_xx_break_threshold: 2,
+            five_xx_break_cooldown_secs: 3600,
+            five_xx_probe_successes: 2,
+            ..NodeBudgetLimits::default()
+        });
+        pool.add(NodeRef::new(
+            "socks5h://user:pass@127.0.0.1:1087".to_string(),
+        ));
+        let node_id = pool.budget_snapshots()[0].node_id.clone();
+
+        // Trigger break.
+        for _ in 0..2 {
+            pool.release(
+                &node_id,
+                &ResultKind::SoftFailure {
+                    kind: crate::pool::ErrorKind::Upstream5xx,
+                },
+            );
+        }
+        assert_eq!(pool.budget_snapshots()[0].node_state, "cooldown");
+
+        // Probe 1 success -> still cooldown, needs 2.
+        assert!(!pool.record_five_xx_probe(&node_id, true, 2));
+        assert_eq!(pool.budget_snapshots()[0].node_state, "cooldown");
+
+        // Probe 2 success -> recovered.
+        assert!(pool.record_five_xx_probe(&node_id, true, 2));
+        assert_eq!(pool.budget_snapshots()[0].node_state, "dispatch");
+        assert!(pool.acquire_for(&meta(100)).is_some());
     }
 }

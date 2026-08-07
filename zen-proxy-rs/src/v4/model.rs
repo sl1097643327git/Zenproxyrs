@@ -43,6 +43,11 @@ impl ModelCompatibilityProfile {
             "big-pickle" => Some(Self::StaticFlashLite),
             "mimo" => Some(Self::StaticMimo),
             "mimo-v2.5" => Some(Self::StaticMimo),
+            "north-mini-code" => Some(Self::StaticFlash),
+            "ling-3.0-flash" => Some(Self::StaticFlashLite),
+            "laguna-s-2.1" => Some(Self::StaticFlashLite),
+            "longcat-2.0" => Some(Self::StaticFlashLite),
+            "nemotron-3-ultra" => Some(Self::StaticFlashLite),
             "hy3" => Some(Self::StaticGeneric),
             "claude-haiku-4-5" => Some(Self::StaticFlash),
             _ => None,
@@ -85,13 +90,21 @@ impl StaticModelRegistry {
         ("deepseek-v4-flash", "deepseek-v4-flash-free"),
         ("big-pickle", "big-pickle"),
         ("mimo-v2.5", "mimo-v2.5-free"),
-        ("hy3", "hy3-free"),
+        ("north-mini-code", "north-mini-code-free"),
+        ("ling-3.0-flash", "ling-3.0-flash-free"),
+        ("laguna-s-2.1", "laguna-s-2.1-free"),
+        ("longcat-2.0", "longcat-2.0-free"),
+        ("nemotron-3-ultra", "nemotron-3-ultra-free"),
     ];
     const REQUEST_ALIASES: &'static [(&'static str, &'static str, &'static str)] = &[
         ("deepseek", "deepseek", "deepseek-v4-flash-free"),
         ("bigpickle", "bigpickle", "big-pickle"),
         ("mimo", "mimo", "mimo-v2.5-free"),
-        ("hy3free", "hy3", "hy3-free"),
+        ("north-mini-code-free", "north-mini-code", "north-mini-code-free"),
+        ("ling-3.0-flash-free", "ling-3.0-flash", "ling-3.0-flash-free"),
+        ("laguna-s-2.1-free", "laguna-s-2.1", "laguna-s-2.1-free"),
+        ("longcat-2.0-free", "longcat-2.0", "longcat-2.0-free"),
+        ("nemotron-3-ultra-free", "nemotron-3-ultra", "nemotron-3-ultra-free"),
     ];
     const HIDDEN_HELPER_MODELS: &'static [(&'static str, &'static str)] =
         &[("claude-haiku-4-5", "deepseek-v4-flash-free")];
@@ -353,7 +366,16 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra"
+            ]
         );
     }
 
@@ -393,10 +415,19 @@ mod tests {
             registry.resolve("mimo-v2.5").unwrap().compatibility_profile,
             ModelCompatibilityProfile::StaticMimo
         );
-        assert_eq!(registry.resolve("hy3").unwrap().upstream_model, "hy3-free");
         assert_eq!(
-            registry.resolve("hy3").unwrap().compatibility_profile,
-            ModelCompatibilityProfile::StaticGeneric
+            registry
+                .resolve("north-mini-code")
+                .unwrap()
+                .upstream_model,
+            "north-mini-code-free"
+        );
+        assert_eq!(
+            registry
+                .resolve("north-mini-code")
+                .unwrap()
+                .compatibility_profile,
+            ModelCompatibilityProfile::StaticFlash
         );
     }
 
@@ -411,7 +442,7 @@ mod tests {
         assert!(!ids.contains(&"deepseek".to_string()));
         assert!(!ids.contains(&"bigpickle".to_string()));
         assert!(!ids.contains(&"mimo".to_string()));
-        assert!(!ids.contains(&"hy3free".to_string()));
+        assert!(!ids.contains(&"north-mini-code-free".to_string()));
 
         let deepseek = registry.resolve("deepseek").unwrap();
         assert_eq!(deepseek.public_model, "deepseek");
@@ -437,12 +468,12 @@ mod tests {
             ModelCompatibilityProfile::StaticMimo
         );
 
-        let hy3 = registry.resolve("hy3free").unwrap();
-        assert_eq!(hy3.public_model, "hy3");
-        assert_eq!(hy3.upstream_model, "hy3-free");
+        let north = registry.resolve("north-mini-code-free").unwrap();
+        assert_eq!(north.public_model, "north-mini-code");
+        assert_eq!(north.upstream_model, "north-mini-code-free");
         assert_eq!(
-            hy3.compatibility_profile,
-            ModelCompatibilityProfile::StaticGeneric
+            north.compatibility_profile,
+            ModelCompatibilityProfile::StaticFlash
         );
     }
 
@@ -507,7 +538,16 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra"
+            ]
         );
         assert!(matches!(
             registry.resolve("new-active-free"),
@@ -532,7 +572,11 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-active",
                 "new-canary"
             ]
@@ -564,7 +608,11 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-active",
                 "new-canary",
                 "new-candidate"
@@ -621,14 +669,14 @@ mod tests {
         let discovery = DynamicModelRegistry::new(true, "url".into());
         discovery
             .update_from_opencode_json(
-                r#"{"data":[{"id":"mimo-v2.5-free"},{"id":"north-mini-code-free"},{"id":"big-pickle"}]}"#,
+                r#"{"data":[{"id":"mimo-v2.5-free"},{"id":"trial-model-free"},{"id":"big-pickle"}]}"#,
             )
             .unwrap();
         let registry = EffectiveModelRegistry::with_dynamic_allowlists(
             DynamicModelPublicMode::CandidateCanaryOrActive,
             discovery.snapshot(),
-            vec!["mimo-v2.5".into(), "north-mini-code".into()],
-            vec!["north-mini-code".into()],
+            vec!["mimo-v2.5".into(), "trial-model".into()],
+            vec!["trial-model".into()],
         );
 
         assert_eq!(
@@ -637,7 +685,7 @@ mod tests {
         );
         assert_eq!(
             registry
-                .resolve("north-mini-code")
+                .resolve("trial-model")
                 .unwrap()
                 .compatibility_profile,
             ModelCompatibilityProfile::DynamicClaudeCodeCompatible
@@ -655,18 +703,18 @@ mod tests {
     fn effective_registry_claudecode_allowlist_accepts_upstream_id() {
         let discovery = DynamicModelRegistry::new(true, "url".into());
         discovery
-            .update_from_opencode_json(r#"{"data":[{"id":"north-mini-code-free"}]}"#)
+            .update_from_opencode_json(r#"{"data":[{"id":"trial-model-free"}]}"#)
             .unwrap();
         let registry = EffectiveModelRegistry::with_dynamic_allowlists(
             DynamicModelPublicMode::CandidateCanaryOrActive,
             discovery.snapshot(),
             Vec::new(),
-            vec!["north-mini-code-free".into()],
+            vec!["trial-model-free".into()],
         );
 
         assert_eq!(
             registry
-                .resolve("north-mini-code")
+                .resolve("trial-model")
                 .unwrap()
                 .compatibility_profile,
             ModelCompatibilityProfile::DynamicClaudeCodeCompatible
@@ -690,7 +738,11 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra",
                 "new-active"
             ]
         );
@@ -714,7 +766,16 @@ mod tests {
         let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
         assert_eq!(
             ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra"
+            ]
         );
         assert_eq!(
             registry.resolve("mimo-v2.5").unwrap().upstream_model,
@@ -753,7 +814,10 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
                 "nemotron-3-ultra"
             ]
         );
@@ -789,7 +853,16 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["deepseek-v4-flash", "big-pickle", "mimo-v2.5", "hy3"]
+            vec![
+                "deepseek-v4-flash",
+                "big-pickle",
+                "mimo-v2.5",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
+                "nemotron-3-ultra"
+            ]
         );
 
         let minimax = registry.resolve("minimax-m3").unwrap();
@@ -829,7 +902,10 @@ mod tests {
                 "deepseek-v4-flash",
                 "big-pickle",
                 "mimo-v2.5",
-                "hy3",
+                "north-mini-code",
+                "ling-3.0-flash",
+                "laguna-s-2.1",
+                "longcat-2.0",
                 "nemotron-3-ultra"
             ]
         );

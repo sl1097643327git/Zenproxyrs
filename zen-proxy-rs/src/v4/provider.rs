@@ -2228,14 +2228,13 @@ fn report_status_failure(
             stream,
         );
     } else {
-        let result = if matches!(status, 502 | 504) {
-            ResultKind::Error {
-                kind: ErrorKind::Upstream5xx,
-            }
-        } else {
-            ResultKind::SoftFailure {
-                kind: ErrorKind::Upstream5xx,
-            }
+        // 5xx (incl. 502/504) is an upstream outage, NOT a bad proxy node.
+        // Report as SoftFailure so the node is simply released back to dispatch
+        // (no dead-pool quarantine, no repeated recovery probes that burn requests).
+        // This matches the legacy proxy.rs semantics and prevents 5xx from
+        // cascading into infinite node isolation + probe loops.
+        let result = ResultKind::SoftFailure {
+            kind: ErrorKind::Upstream5xx,
         };
         state
             .pool_manager
@@ -2351,12 +2350,16 @@ fn result_kind_for_app_error(
     error_kind: ErrorKind,
     error_type: &str,
 ) -> ResultKind {
+    // 5xx (incl. 502/504) is an upstream outage, NOT a bad proxy node.
+    // Keep it as SoftFailure so the node is released back to dispatch rather
+    // than buried in the dead pool (which would spawn repeated recovery probes
+    // that burn requests). Matches legacy proxy.rs semantics.
     if matches!(
         err.status,
         StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
     ) && error_type == "upstream_error"
     {
-        return ResultKind::Error {
+        return ResultKind::SoftFailure {
             kind: ErrorKind::Upstream5xx,
         };
     }

@@ -48,6 +48,18 @@ auth_h!(stats_pools_h, AdminService::stats_pools);
 auth_h!(stats_upstream_h, AdminService::stats_upstream);
 auth_h!(routes_h, AdminService::routes);
 auth_h!(runtime_h, AdminService::runtime);
+async fn clash_now_h(State(st): State<Arc<AppState>>, h: HeaderMap) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::clash_now(&st).await
+}
+async fn clash_invalid_clear_h(State(st): State<Arc<AppState>>, h: HeaderMap) -> Response {
+    if AdminService::check_auth(&h, &st).is_err() {
+        return err("unauthorized");
+    }
+    AdminService::clash_invalid_clear(&st)
+}
 auth_h!(models_h, AdminService::models);
 auth_h!(budget_h, AdminService::budget);
 auth_h!(budget_nodes_h, AdminService::budget_nodes);
@@ -72,6 +84,7 @@ auth_h!(sys_info_h, AdminService::system_info);
 auth_h!(events_recent_h, AdminService::events_recent);
 auth_h!(events_probes_h, AdminService::events_probes);
 auth_h!(nodes_list_h, AdminService::nodes);
+auth_h!(failed_nodes_h, AdminService::failed_nodes);
 
 async fn pool_by_name_h(
     State(st): State<Arc<AppState>>,
@@ -411,6 +424,8 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin/health/ready", get(health_ready_h))
         .route("/admin/routes", get(routes_h))
         .route("/admin/runtime", get(runtime_h))
+        .route("/admin/clash/now", get(clash_now_h))
+        .route("/admin/clash/invalid/clear", post(clash_invalid_clear_h))
         .route("/admin/models", get(models_h))
         .route("/admin/models/{model_id}", get(model_detail_h))
         .route("/admin/models/{model_id}/probes", get(model_probes_h))
@@ -470,7 +485,9 @@ pub fn admin_router() -> Router<Arc<AppState>> {
 
     // Static /admin/nodes and parameterized /admin/nodes/{node_id} in separate
     // routers to avoid matchit route conflict in axum 0.8.
-    let nodes_static = Router::new().route("/admin/nodes", get(nodes_list_h).post(node_add_h));
+    let nodes_static = Router::new()
+        .route("/admin/nodes", get(nodes_list_h).post(node_add_h))
+        .route("/admin/nodes/failed", get(failed_nodes_h));
     let nodes_param = Router::new()
         .route("/admin/nodes/{node_id}", delete(node_delete_h))
         .route("/admin/nodes/{node_id}/budget", get(node_budget_h))

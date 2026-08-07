@@ -43,6 +43,7 @@ use pool::global_budget::{GlobalBudgetConfig, GlobalBudgetRegistry};
 use pool::manager::PoolManagerImpl;
 use pool::ratelimited::RateLimitedPoolImpl;
 use pool::{DeadPool, NodeRef, Pool, RateLimitedPool, ResultKind};
+use provider::clash::ClashCoordinator;
 use provider::webshare::WebShareProvider;
 use state::AppState;
 use v4::model::ModelRegistry;
@@ -283,6 +284,52 @@ async fn discover_dynamic_models_once(state: &AppState) {
     }
 }
 
+/// Fallback group resolution for clash mode: query the Clash API for its
+/// routable Selector groups and pick the one at `idx` (reusing the last API
+/// entry when there are more listeners than APIs). Used when neither
+/// `CLASH_GROUP_NAMES` nor a usable `CLASH_CONFIG_FILE` is available.
+async fn discover_group_for_instance(config: &config::Config, idx: usize, proxy: &str) -> String {
+    let api = config
+        .clash_api_urls
+        .get(idx)
+        .or_else(|| config.clash_api_urls.last());
+    let secret = config
+        .clash_api_secrets
+        .get(idx)
+        .or_else(|| config.clash_api_secrets.last());
+    match api {
+        Some(api) => match ClashCoordinator::discover_selector_groups(
+            api,
+            secret.map(String::as_str),
+        )
+        .await
+        {
+            Ok(groups) if !groups.is_empty() => groups
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| groups[0].clone()),
+            Ok(_) => {
+                tracing::warn!(
+                    api,
+                    proxy,
+                    "no Selector group found on this API; using 'Proxy'"
+                );
+                "Proxy".to_string()
+            }
+            Err(err) => {
+                tracing::warn!(
+                    api,
+                    proxy,
+                    error = %err,
+                    "group auto-discovery failed; using 'Proxy'"
+                );
+                "Proxy".to_string()
+            }
+        },
+        None => "Proxy".to_string(),
+    }
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c().await.expect("Ctrl+C handler");
@@ -330,6 +377,102 @@ async fn async_main() {
 
     tracing::info!(count = node_urls.len(), "loaded proxy nodes");
 
+    // Clash mode: build a coordinator driving each Clash instance's internal
+    // Selector group. Its proxy URLs (local mixed ports) are the zen-proxy nodes.
+    let clash_coordinator = if config.node_provider_mode == config::NodeProviderMode::Clash
+        && !config.clash_api_urls.is_empty()
+    {
+        // Resolve group names: an explicit CLASH_GROUP_NAMES wins; otherwise
+        // try the mihomo config file (its `listeners` section maps each local
+        // port to the *current* Selector group, so renames are picked up
+        // automatically); as a last resort, auto-discover the Selector groups
+        // exposed by each Clash API and assign them by index. The chosen
+        // mapping is logged so you can verify it against your GUI bindings.
+        let group_names = if config.clash_group_names.is_empty() {
+            let mut discovered: Vec<String> = Vec::new();
+            match &config.clash_config_file {
+                Some(path) => {
+                    match ClashCoordinator::discover_groups_from_config_file(
+                        path,
+                        &config.clash_proxy_urls,
+                    ) {
+                        Ok(groups) if !groups.is_empty() => {
+                            tracing::info!(
+                                file = path,
+                                groups = ?groups,
+                                "clash mode: group names from config file listeners (set CLASH_GROUP_NAMES to override)"
+                            );
+                            groups
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                file = path,
+                                "clash config file has no listener port/proxy entries; falling back to API discovery"
+                            );
+                            for (idx, proxy) in config.clash_proxy_urls.iter().enumerate() {
+                                discovered.push(
+                                    discover_group_for_instance(&config, idx, proxy).await,
+                                );
+                            }
+                            discovered
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                file = path,
+                                error = %err,
+                                "clash config file parse failed; falling back to API discovery"
+                            );
+                            for (idx, proxy) in config.clash_proxy_urls.iter().enumerate() {
+                                discovered.push(
+                                    discover_group_for_instance(&config, idx, proxy).await,
+                                );
+                            }
+                            discovered
+                        }
+                    }
+                }
+                None => {
+                    for (idx, proxy) in config.clash_proxy_urls.iter().enumerate() {
+                        discovered.push(discover_group_for_instance(&config, idx, proxy).await);
+                    }
+                    discovered
+                }
+            }
+        } else {
+            config.clash_group_names.clone()
+        };
+
+        match ClashCoordinator::from_config(
+            &config.clash_api_urls,
+            &config.clash_api_secrets,
+            &config.clash_proxy_urls,
+            &group_names,
+            config.clash_switch_max_attempts,
+            config.clash_invalid_ttl_secs,
+        ) {
+            Some(coord) => {
+                tracing::info!(
+                    instances = coord.instance_count(),
+                    groups = ?group_names,
+                    "clash provider mode: coordinator enabled"
+                );
+                // Startup: reconcile each Clash instance onto a distinct
+                // internal node before serving traffic (a fresh core can leave
+                // every group on the same default selection).
+                coord.ensure_distinct_nodes().await;
+                Some(coord)
+            }
+            None => {
+                tracing::warn!(
+                    "NODE_PROVIDER_MODE=clash but no valid CLASH_API_URLS/CLASH_PROXY_URLS pair; falling back to webshare nodes"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let _provider = Arc::new(WebShareProvider::new(node_urls.clone()));
     let mut dispatch = DispatchPool::new_with_options(
         NodeBudgetLimits {
@@ -337,6 +480,10 @@ async fn async_main() {
             max_tokens_per_window: config.node_max_tokens_per_window,
             max_kb_per_window: config.node_max_kb_per_window,
             cooldown_secs: config.node_budget_cooldown_secs,
+            window_secs: config.node_budget_window_secs,
+            five_xx_break_threshold: config.node_5xx_break_threshold,
+            five_xx_break_cooldown_secs: config.node_5xx_break_cooldown_secs,
+            five_xx_probe_successes: config.node_5xx_probe_successes,
         },
         AimdConfig {
             min_concurrent: config.v43_node_min_concurrency,
@@ -434,6 +581,9 @@ async fn async_main() {
         config.request_timeout(),
         config.allow_direct_fallback,
     ));
+    if let Some(coord) = &clash_coordinator {
+        pool_manager.set_clash_coordinator(Some(coord.clone()));
+    }
     for url in &node_urls {
         pool_manager.register_known_node(NodeRef::new(url.clone()));
     }
@@ -492,13 +642,36 @@ async fn async_main() {
         });
     }
 
-    // Background: low-frequency adaptive Dead-pool recovery.
+    // Background: adaptive Dead-pool + RateLimited-pool recovery.
+    //
+    // Rate-limited nodes MUST be retried on the same day (the pool's
+    // date-based filter would otherwise leave them dead until midnight), so
+    // this runs every minute. Clash mode rotates to a fresh internal node
+    // before each probe.
     {
         let state = app_state.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60 * 60)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 state.pool_manager.probe_dead_adaptive();
+                state.pool_manager.probe_ratelimited_adaptive();
+            }
+        });
+    }
+
+    // Background: 5xx circuit-break recovery probe.
+    //
+    // Nodes that hit the consecutive-5xx circuit break are quarantined in a
+    // cooldown state; this task probes them with a tiny "1+1" request every
+    // node_5xx_probe_interval_ms and lifts the break after consecutive
+    // successes. This avoids hammering a failing upstream with real traffic.
+    {
+        let state = app_state.clone();
+        let interval_ms = config.node_5xx_probe_interval_ms.max(100);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
+                state.pool_manager.probe_five_xx_adaptive();
             }
         });
     }

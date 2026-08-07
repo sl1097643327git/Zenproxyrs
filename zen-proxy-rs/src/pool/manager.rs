@@ -7,6 +7,7 @@ use crate::pool::node_registry::NodeRegistry;
 use crate::pool::probe_period::ProbePeriod;
 use crate::pool::transport::TransportRegistry;
 use crate::pool::*;
+use crate::provider::clash::ClashCoordinator;
 use crate::v4::contracts::{DeadNodeState, DeadProbePolicy};
 use crate::v4::dead_probe::AdaptiveDeadProbePolicy;
 
@@ -32,14 +33,15 @@ where
     upstream_api_key: String,
     probe_timeout_secs: u64,
     allow_direct_fallback: bool,
+    clash: std::sync::Mutex<Option<Arc<ClashCoordinator>>>,
 }
 
 impl<D, A, R, K> PoolManagerImpl<D, A, R, K>
 where
-    D: Pool,
-    A: Pool,
-    R: RateLimitedPool,
-    K: DeadPool,
+    D: Pool + 'static,
+    A: Pool + 'static,
+    R: RateLimitedPool + 'static,
+    K: DeadPool + 'static,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -68,7 +70,18 @@ where
             upstream_api_key,
             probe_timeout_secs,
             allow_direct_fallback,
+            clash: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Inject the Clash coordinator for clash provider mode.
+    /// No-op for webshare/legacy mode.
+    pub fn set_clash_coordinator(&self, clash: Option<Arc<ClashCoordinator>>) {
+        *self.clash.lock().unwrap() = clash;
+    }
+
+    pub fn clash_coordinator(&self) -> Option<Arc<ClashCoordinator>> {
+        self.clash.lock().unwrap().clone()
     }
 
     pub fn register_known_node(&self, node: NodeRef) {
@@ -128,6 +141,137 @@ where
             affinity_node_id,
             session_pin_hit: false,
         })
+    }
+
+    /// Spawn a background recovery probe for a quarantined node.
+    ///
+    /// * **Clash mode**: first switch the Clash instance's internal node (so the
+    ///   probe flows out through a fresh IP), then probe through the same client.
+    ///   If the fresh node also fails, it is recorded as invalid so the next
+    ///   rotation skips it.
+    /// * **Webshare/legacy mode**: probe the node in place.
+    fn spawn_recovery_probe(&self, node_id: NodeId, node: &NodeRef, pool_label: &str) {
+        let clash = self.clash_coordinator();
+        let instance_idx = clash
+            .as_ref()
+            .and_then(|c| c.instance_for_proxy_url(&node.url));
+        tracing::info!(
+            pool = pool_label,
+            node_id = %node_id,
+            url = %node.url,
+            has_coordinator = clash.is_some(),
+            instance_idx = ?instance_idx,
+            "recovery probe spawned"
+        );
+
+        let ratelimited = self.ratelimited.clone();
+        let dead = self.dead.clone();
+        let dispatch = self.dispatch.clone();
+        let collector = self.collector.clone();
+        let client = self.transport.client_for_node(node);
+        let upstream = self.upstream_base.clone();
+        let timeout = self.probe_timeout_secs;
+        let api_key = self.upstream_api_key.clone();
+        let nid = node_id.clone();
+        let nr = node.clone();
+        let label = pool_label.to_string();
+
+        tokio::spawn(async move {
+            if let (Some(coord), Some(idx)) = (clash, instance_idx) {
+                // Rotate through fresh internal nodes until one passes the
+                // probe or we exhaust max_attempts. Each failure blacklists
+                // that node so the next rotation picks a different exit IP.
+                let max_attempts = coord.max_attempts();
+                let mut ok = false;
+                let mut attempts = 0usize;
+                while attempts < max_attempts {
+                    attempts += 1;
+                    match coord.switch_internal_node(idx).await {
+                        Ok(Some(result)) => {
+                            tracing::info!(
+                                attempt = attempts,
+                                from = %result.from,
+                                to = %result.to,
+                                "recovery probe: switched internal node"
+                            );
+                            let probe = ProbePeriod::probe_node_detailed(
+                                &client,
+                                &nr,
+                                &upstream,
+                                timeout,
+                                &api_key,
+                            )
+                            .await;
+                            ok = probe.is_ok();
+                            tracing::info!(
+                                attempt = attempts,
+                                ok,
+                                "recovery probe: probe result"
+                            );
+                            if ok {
+                                break;
+                            }
+                            if let Some(now) = coord.current_in_use(idx) {
+                                // Fresh IP also exhausted: remember it so
+                                // the next rotation skips it. Record *why*
+                                // the probe failed so the failed-nodes list
+                                // can distinguish 429 / 5xx / offline.
+                                let reason = probe.err().map_or("other", |r| r.as_str());
+                                coord.mark_invalid(idx, &now, reason);
+                            }
+                        }
+                        Ok(None) => {
+                            // No candidate to rotate to: keep quarantined.
+                            tracing::info!(attempt = attempts, "recovery probe: no switch candidate");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::info!(attempt = attempts, error = %e, "recovery probe: switch failed");
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    ratelimited.recover(&nid);
+                    dead.recover(&nid);
+                    dispatch.add(NodeRef {
+                        id: nid.clone(),
+                        url: nr.url.clone(),
+                    });
+                    dispatch.release(&nid, &ResultKind::Success(200));
+                }
+                collector.record_probe(&ProbeEvent {
+                    ts: chrono::Utc::now().timestamp(),
+                    node_id: nid,
+                    pool: if ok {
+                        format!("{}_clash_switch", label)
+                    } else {
+                        format!("{}_clash_switch_exhausted", label)
+                    },
+                    ok,
+                    latency_ms: 0,
+                });
+            } else {
+                let ok =
+                    ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
+                if ok {
+                    ratelimited.recover(&nid);
+                    dead.recover(&nid);
+                    dispatch.add(NodeRef {
+                        id: nid.clone(),
+                        url: nr.url.clone(),
+                    });
+                    dispatch.release(&nid, &ResultKind::Success(200));
+                }
+                collector.record_probe(&ProbeEvent {
+                    ts: chrono::Utc::now().timestamp(),
+                    node_id: nid,
+                    pool: label,
+                    ok,
+                    latency_ms: 0,
+                });
+            }
+        });
     }
 }
 
@@ -227,37 +371,7 @@ where
                 self.dispatch.remove(&node_id);
 
                 if let Some(nr) = self.nodes.get(&node_id) {
-                    let ratelimited = self.ratelimited.clone();
-                    let dispatch = self.dispatch.clone();
-                    let collector = self.collector.clone();
-                    let client = self.transport.client_for_node(&nr);
-                    let upstream = self.upstream_base.clone();
-                    let timeout = self.probe_timeout_secs;
-                    let api_key = self.upstream_api_key.clone();
-                    let nid = node_id.clone();
-
-                    tokio::spawn(async move {
-                        let ok =
-                            ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key)
-                                .await;
-
-                        if ok {
-                            ratelimited.recover(&nid);
-                            dispatch.add(NodeRef {
-                                id: nid.clone(),
-                                url: nr.url.clone(),
-                            });
-                            dispatch.release(&nid, &ResultKind::Success(200));
-                        }
-
-                        collector.record_probe(&ProbeEvent {
-                            ts: chrono::Utc::now().timestamp(),
-                            node_id: nid,
-                            pool: "ratelimited_probe".to_string(),
-                            ok,
-                            latency_ms: 0,
-                        });
-                    });
+                    self.spawn_recovery_probe(node_id.clone(), &nr, "ratelimited_probe");
                 }
             }
             ResultKind::EmptyOutput => {
@@ -268,37 +382,7 @@ where
                 self.dispatch.remove(&node_id);
 
                 if let Some(nr) = self.nodes.get(&node_id) {
-                    let ratelimited = self.ratelimited.clone();
-                    let dispatch = self.dispatch.clone();
-                    let collector = self.collector.clone();
-                    let client = self.transport.client_for_node(&nr);
-                    let upstream = self.upstream_base.clone();
-                    let timeout = self.probe_timeout_secs;
-                    let api_key = self.upstream_api_key.clone();
-                    let nid = node_id.clone();
-
-                    tokio::spawn(async move {
-                        let ok =
-                            ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key)
-                                .await;
-
-                        if ok {
-                            ratelimited.recover(&nid);
-                            dispatch.add(NodeRef {
-                                id: nid.clone(),
-                                url: nr.url.clone(),
-                            });
-                            dispatch.release(&nid, &ResultKind::Success(200));
-                        }
-
-                        collector.record_probe(&ProbeEvent {
-                            ts: chrono::Utc::now().timestamp(),
-                            node_id: nid,
-                            pool: "empty_output_probe".to_string(),
-                            ok,
-                            latency_ms: 0,
-                        });
-                    });
+                    self.spawn_recovery_probe(node_id.clone(), &nr, "empty_output_probe");
                 }
             }
             ResultKind::ClientGone => {
@@ -317,6 +401,14 @@ where
                     .release_with_latency(&node_id, &result, latency_ms);
                 self.dispatch.remove(&node_id);
                 if let Some(node) = self.nodes.get(&node_id) {
+                    // Probe-verified rotation: in clash mode spawn_recovery_probe
+                    // rotates the owning instance through fresh internal nodes and
+                    // probe-verifies each one, blacklisting failures. This stops a
+                    // persistently-rejected exit IP (e.g. all JP nodes returning
+                    // 403) from being re-picked, and on success the node is moved
+                    // back to dispatch and out of the dead pool. The node is kept
+                    // quarantined (dead pool) until a rotation succeeds.
+                    self.spawn_recovery_probe(node_id.clone(), &node, "error_recovery");
                     self.dead.add(node);
                 }
                 self.dead.bury(node_id);
@@ -369,6 +461,30 @@ where
 
     fn node_budget_detail(&self, node_id: &str) -> Option<serde_json::Value> {
         self.dispatch.node_budget_detail(&node_id.to_string())
+    }
+
+    fn failed_nodes(&self) -> Vec<serde_json::Value> {
+        let mut out = self.dead.failure_snapshot();
+        out.extend(self.ratelimited.failure_snapshot());
+        // 5xx circuit-break (cooldown) nodes surface here too.
+        for (node_id, url, until) in self.dispatch.five_xx_break_candidates() {
+            let cooldown_secs = until
+                .map(|t| (t - chrono::Utc::now().timestamp()).max(0))
+                .unwrap_or(0);
+            out.push(serde_json::json!({
+                "node_id": node_id,
+                "url": crate::ledger::LedgerEvent::redact_node_url(&url),
+                "state": "cooling",
+                "reason": "circuit_break_5xx",
+                "cooldown_secs": cooldown_secs,
+            }));
+        }
+        // Clash-internal nodes that failed probing / were rate-limited, kept
+        // per instance in the coordinator's blacklist (TTL = invalid_ttl).
+        if let Some(coord) = self.clash_coordinator() {
+            out.extend(coord.invalid_snapshot());
+        }
+        out
     }
 
     fn fuse_all(&self) {
@@ -487,8 +603,19 @@ where
             let timeout = self.probe_timeout_secs;
             let api_key = self.upstream_api_key.clone();
             let fuse_is_open = self.fuse.load(Ordering::Acquire);
+            // Clash mode: rotate this instance to a fresh internal node before
+            // probing, so a node that died because its exit IP was throttled
+            // gets re-tested through a different IP. A single switch is enough;
+            // the dead pool has its own backoff for subsequent attempts.
+            let clash = self.clash_coordinator();
+            let instance_idx = clash
+                .as_ref()
+                .and_then(|c| c.instance_for_proxy_url(&nr.url));
 
             tokio::spawn(async move {
+                if let (Some(coord), Some(idx)) = (clash, instance_idx) {
+                    let _ = coord.switch_internal_node(idx).await;
+                }
                 let start = std::time::Instant::now();
                 let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
                 let latency_ms = start.elapsed().as_millis() as u64;
@@ -512,6 +639,60 @@ where
         }
     }
 
+    fn probe_ratelimited_adaptive(&self) {
+        // Take a small batch of quarantined nodes (NOT date-filtered: a node
+        // rate-limited today must be retried today, otherwise it stays dead
+        // until midnight). Each recovery probe reuses spawn_recovery_probe so
+        // clash mode rotates the instance to a fresh internal node first.
+        let ids = self.ratelimited.select_all_for_probe(2);
+        for id in ids {
+            let Some(nr) = self.nodes.get(&id) else {
+                continue;
+            };
+            self.spawn_recovery_probe(id, &nr, "ratelimited_adaptive");
+        }
+    }
+
+    fn probe_five_xx_adaptive(&self) {
+        // Probe nodes in 5xx circuit-break cooldown. Each candidate gets a tiny
+        // "1+1" request; consecutive successes (>= required) lift the break.
+        let candidates = self.dispatch.five_xx_break_candidates();
+        if candidates.is_empty() {
+            return;
+        }
+        let required = self.dispatch.five_xx_probe_successes();
+        for (id, _url, _until) in candidates {
+            let Some(nr) = self.nodes.get(&id) else {
+                continue;
+            };
+            let dispatch = self.dispatch.clone();
+            let collector = self.collector.clone();
+            let client = self.transport.client_for_node(&nr);
+            let upstream = self.upstream_base.clone();
+            let timeout = self.probe_timeout_secs;
+            let api_key = self.upstream_api_key.clone();
+            tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let ok = ProbePeriod::probe_node(&client, &nr, &upstream, timeout, &api_key).await;
+                let latency_ms = start.elapsed().as_millis() as u64;
+                let recovered = dispatch.record_five_xx_probe(&id, ok, required);
+                if recovered {
+                    tracing::info!(
+                        node_id = %id,
+                        "5xx circuit break lifted: upstream recovered"
+                    );
+                }
+                collector.record_probe(&ProbeEvent {
+                    ts: chrono::Utc::now().timestamp(),
+                    node_id: id,
+                    pool: "five_xx_break_probe".to_string(),
+                    ok,
+                    latency_ms,
+                });
+            });
+        }
+    }
+
     fn runtime_details(&self) -> serde_json::Value {
         let transport = self.transport.snapshot();
         serde_json::json!({
@@ -525,6 +706,57 @@ where
                 "request_timeout_secs": transport.request_timeout_secs,
             }
         })
+    }
+
+    fn clash_snapshot(&self) -> serde_json::Value {
+        match self.clash_coordinator() {
+            Some(coord) => coord.snapshot(),
+            None => serde_json::json!({ "mode": "webshare" }),
+        }
+    }
+
+    fn clash_coordinator(&self) -> Option<std::sync::Arc<ClashCoordinator>> {
+        self.clash.lock().unwrap().clone()
+    }
+
+    /// Per-instance availability: maps each Clash instance's proxy URL to the
+    /// zen-proxy node's current pool state (dispatch=available, dead/ratelimited
+    /// =unavailable). Used by /admin/clash/now so the dashboard can show which
+    /// Clash instance is down.
+    fn clash_instances_state(&self) -> serde_json::Value {
+        let Some(coord) = self.clash_coordinator() else {
+            return serde_json::json!({ "mode": "webshare", "instances": [] });
+        };
+        let count = coord.instance_count();
+        let proxy_urls = coord.proxy_urls();
+        let mut instances = Vec::with_capacity(count);
+        for idx in 0..count {
+            let proxy_url = proxy_urls.get(idx).cloned().unwrap_or_default();
+            let node_id = crate::pool::sha256_first8(&proxy_url);
+            // Determine which pool the node currently lives in. Nodes in
+            // dispatch/active are usable; ratelimited/dead are not.
+            let (available, state) = if self.dispatch.node_budget_detail(&node_id).is_some() {
+                (true, "dispatch")
+            } else if self.ratelimited.get_node_ref(&node_id).is_some() {
+                (false, "ratelimited")
+            } else if self.dead.get_node_ref(&node_id).is_some() {
+                (false, "dead")
+            } else {
+                (false, "unknown")
+            };
+            // current_node comes from the coordinator's cached in_use state
+            // (last known selection); the live value is fetched by the admin
+            // handler which owns an async context.
+            let current = coord.current_node_cached(idx);
+            instances.push(serde_json::json!({
+                "idx": idx,
+                "proxy_url": proxy_url,
+                "current_node": current,
+                "available": available,
+                "state": state,
+            }));
+        }
+        serde_json::json!({ "mode": "clash", "instances": instances })
     }
 }
 
@@ -628,8 +860,8 @@ mod tests {
         assert!(manager.dispatch(&meta).is_ok());
     }
 
-    #[test]
-    fn hard_proxy_error_moves_node_to_dead_pool() {
+    #[tokio::test]
+    async fn hard_proxy_error_moves_node_to_dead_pool() {
         let dispatch = Arc::new(DispatchPool::new());
         let active = Arc::new(ActivePool::new());
         let ratelimited = Arc::new(RateLimitedPoolImpl::new());

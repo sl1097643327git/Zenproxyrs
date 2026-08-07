@@ -7,3 +7,23 @@ nodes.json
 .DS_Store
 .idea/
 .vscode/
+
+# Local deploy/diagnostic scripts that embed server credentials
+deploy_*.py
+diag_*.py
+verify_*.py
+nodes-check.yml
+
+# Local run config with hardcoded API keys
+zen-proxy-rs/start_local.cmd
+zen-proxy-rs/localrun.log
+
+# Build artifacts / test fixtures
+zen-proxy-rs-bin*
+/sse-test/
+/sse-test.7z
+/.playwright-mcp/
+
+# Server-specific Dockerfile variant (kept out of the repo)
+Dockerfile.server
+
