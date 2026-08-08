@@ -1571,6 +1571,9 @@ async fn call_with_retry(
     let mut retry_chain = Vec::new();
     let retry_budget_ms = effective_retry_budget_ms(path, &request_meta, conf.v4_retry_budget_ms);
     let mut force_direct_next = false;
+    // Upstream 5xx (500/502/504) may be retried on a different node at most
+    // once; 503 (SERVICE_UNAVAILABLE) is passed through immediately.
+    let mut five_xx_retried = false;
 
     for attempt in 0..=empty_upstream_max {
         let dispatch_start = Instant::now();
@@ -1994,6 +1997,58 @@ async fn call_with_retry(
                         error_type: error_type.to_string(),
                     });
                 }
+                // Upstream 5xx retry policy: a genuine upstream 5xx
+                // (500/502/503/504) must not hammer the pool. Genuine upstream
+                // responses are identified by upstream_error_kind (only
+                // AppError::upstream() sets it); network-synthesized 502/504
+                // (timeouts, connection errors) keep their existing retry
+                // behavior.
+                //   - 503 SERVICE_UNAVAILABLE -> pass through immediately (the
+                //     upstream is overloaded; switching nodes won't help), and
+                //     honor Retry-After.
+                //   - 500/502/504 -> retry on a different node at most once.
+                if err.upstream_error_kind.is_some() && err.status.is_server_error() {
+                    match should_retry_on_upstream_5xx(err.status) {
+                        RetryDecision::Passthrough => {
+                            return Err(V4CallError::after_dispatch(
+                                status,
+                                err.message.clone(),
+                                retry_after,
+                                request_id,
+                                node_id,
+                                &node_url,
+                                upstream_model,
+                                "upstream_error",
+                                attempt,
+                                was_rate_limited || provider_rate_limited,
+                                latency,
+                                "upstream_error",
+                                retry_chain,
+                            ));
+                        }
+                        RetryDecision::RetryOnce => {
+                            if five_xx_retried {
+                                return Err(V4CallError::after_dispatch(
+                                    status,
+                                    err.message.clone(),
+                                    retry_after,
+                                    request_id,
+                                    node_id,
+                                    &node_url,
+                                    upstream_model,
+                                    "upstream_error",
+                                    attempt,
+                                    was_rate_limited || provider_rate_limited,
+                                    latency,
+                                    "upstream_error",
+                                    retry_chain,
+                                ));
+                            }
+                            five_xx_retried = true;
+                        }
+                        RetryDecision::GiveUp => {}
+                    }
+                }
                 let elapsed_ms = retry_chain_latency_ms(&retry_chain);
                 if retry_budget_ms > 0 && elapsed_ms >= retry_budget_ms {
                     return Err(V4CallError::after_dispatch(
@@ -2412,6 +2467,28 @@ fn is_direct_fallback_status(status: StatusCode) -> bool {
         status,
         StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT
     )
+}
+
+/// How the proxy should react to a genuine upstream 5xx response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    /// 503 SERVICE_UNAVAILABLE: upstream is overloaded, switching nodes won't
+    /// help. Pass through immediately, honoring Retry-After.
+    Passthrough,
+    /// 500/502/504: retry on a different node at most once.
+    RetryOnce,
+    /// Any other 5xx: keep the existing retry-budget behavior.
+    GiveUp,
+}
+
+fn should_retry_on_upstream_5xx(status: StatusCode) -> RetryDecision {
+    match status {
+        StatusCode::SERVICE_UNAVAILABLE => RetryDecision::Passthrough,
+        StatusCode::INTERNAL_SERVER_ERROR
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::GATEWAY_TIMEOUT => RetryDecision::RetryOnce,
+        _ => RetryDecision::GiveUp,
+    }
 }
 
 fn is_empty_upstream_error(err: &AppError) -> bool {
@@ -4969,5 +5046,57 @@ data: [DONE]
             }
             _ => panic!("expected HasOutput"),
         }
+    }
+
+    #[test]
+    fn upstream_503_maps_to_passthrough() {
+        assert_eq!(
+            should_retry_on_upstream_5xx(StatusCode::SERVICE_UNAVAILABLE),
+            RetryDecision::Passthrough
+        );
+    }
+
+    #[test]
+    fn upstream_500_502_504_map_to_retry_once() {
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(
+                should_retry_on_upstream_5xx(status),
+                RetryDecision::RetryOnce,
+                "status {} should map to RetryOnce",
+                status.as_u16()
+            );
+        }
+    }
+
+    #[test]
+    fn other_upstream_5xx_maps_to_give_up() {
+        for status in [
+            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+        ] {
+            assert_eq!(
+                should_retry_on_upstream_5xx(status),
+                RetryDecision::GiveUp,
+                "status {} should map to GiveUp",
+                status.as_u16()
+            );
+        }
+    }
+
+    #[test]
+    fn non_5xx_statuses_never_retry_as_upstream_5xx() {
+        // 429 and 4xx are handled by their own paths, never by this policy.
+        assert_eq!(
+            should_retry_on_upstream_5xx(StatusCode::TOO_MANY_REQUESTS),
+            RetryDecision::GiveUp
+        );
+        assert_eq!(
+            should_retry_on_upstream_5xx(StatusCode::BAD_REQUEST),
+            RetryDecision::GiveUp
+        );
     }
 }

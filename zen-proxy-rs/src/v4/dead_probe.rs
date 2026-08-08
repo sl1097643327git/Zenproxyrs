@@ -9,9 +9,11 @@ pub struct AdaptiveDeadProbePolicy {
 
 impl Default for AdaptiveDeadProbePolicy {
     fn default() -> Self {
+        // 上游闪断（outage 窗口）恢复后，dead 节点应在约 1 分钟内被重新探测；
+        // 真死节点最多 10 分钟重测一次，避免探测请求长期不发给上游。
         Self {
-            min_delay_secs: 60 * 60,
-            max_delay_secs: 120 * 60,
+            min_delay_secs: 60,
+            max_delay_secs: 10 * 60,
         }
     }
 }
@@ -84,11 +86,11 @@ mod tests {
     }
 
     #[test]
-    fn delay_is_between_sixty_and_one_hundred_twenty_minutes() {
+    fn delay_is_between_sixty_seconds_and_ten_minutes() {
         let policy = AdaptiveDeadProbePolicy::default();
         for id in ["a", "b", "c", "d"] {
             let delay = policy.next_delay_secs(&dead_node(id, 3, 0.0));
-            assert!((3600..=7200).contains(&delay));
+            assert!((60..=600).contains(&delay));
         }
     }
 

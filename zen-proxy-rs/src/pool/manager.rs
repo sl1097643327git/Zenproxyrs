@@ -1,6 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::collector::{DataCollector, ProbeEvent};
 use crate::pool::node_registry::NodeRegistry;
@@ -13,6 +14,14 @@ use crate::v4::dead_probe::AdaptiveDeadProbePolicy;
 
 const DIRECT_NODE_ID: &str = "direct";
 const DIRECT_NODE_URL: &str = "direct";
+
+/// How long (seconds) a burst of hard node failures is attributed to the
+/// upstream before we treat it as an upstream-level outage.
+const UPSTREAM_FAILURE_WINDOW_SECS: i64 = 30;
+/// After an upstream-outage verdict, keep nodes in dispatch for this many
+/// seconds so requests keep hitting the upstream (fast retry) instead of
+/// being quarantined to the dead pool.
+const UPSTREAM_DEGRADED_GRACE_SECS: i64 = 60;
 
 pub struct PoolManagerImpl<D, A, R, K>
 where
@@ -34,6 +43,11 @@ where
     probe_timeout_secs: u64,
     allow_direct_fallback: bool,
     clash: std::sync::Mutex<Option<Arc<ClashCoordinator>>>,
+    /// Rolling window of recent hard node failures: (node_id, failure time).
+    /// Used to distinguish "the upstream is down" from "one exit is bad".
+    recent_failures: Mutex<VecDeque<(NodeId, Instant)>>,
+    /// Epoch seconds when the upstream was last judged degraded; 0 = healthy.
+    upstream_degraded_since: AtomicI64,
 }
 
 impl<D, A, R, K> PoolManagerImpl<D, A, R, K>
@@ -71,6 +85,8 @@ where
             probe_timeout_secs,
             allow_direct_fallback,
             clash: std::sync::Mutex::new(None),
+            recent_failures: Mutex::new(VecDeque::new()),
+            upstream_degraded_since: AtomicI64::new(0),
         }
     }
 
@@ -86,6 +102,46 @@ where
 
     pub fn register_known_node(&self, node: NodeRef) {
         self.nodes.insert(node);
+    }
+
+    /// Record a hard (network-level) failure for a node. If two or more
+    /// *distinct* nodes fail within a short window, we judge the upstream
+    /// itself to be degraded rather than blaming individual exits.
+    fn record_upstream_failure(&self, node_id: &NodeId) {
+        let now = Instant::now();
+        let window = Duration::from_secs(UPSTREAM_FAILURE_WINDOW_SECS.max(1) as u64);
+        let mut failures = self.recent_failures.lock().unwrap();
+        failures.push_back((node_id.clone(), now));
+        failures.retain(|(_, ts)| now.duration_since(*ts) <= window);
+        let distinct: std::collections::HashSet<&NodeId> =
+            failures.iter().map(|(id, _)| id).collect();
+        if distinct.len() >= 2 {
+            let since = chrono::Utc::now().timestamp();
+            let prev = self.upstream_degraded_since.swap(since, Ordering::Release);
+            if prev == 0 {
+                tracing::warn!(
+                    distinct_nodes = distinct.len(),
+                    "upstream judged degraded: multiple nodes failed in the same window"
+                );
+            }
+        }
+    }
+
+    /// True while an upstream-outage verdict is still fresh (within the
+    /// degraded grace period). During this time hard failures do NOT move
+    /// nodes to the dead pool; they stay in dispatch for fast retries.
+    fn upstream_degraded(&self) -> bool {
+        let since = self.upstream_degraded_since.load(Ordering::Acquire);
+        if since == 0 {
+            return false;
+        }
+        let now = chrono::Utc::now().timestamp();
+        now.saturating_sub(since) < UPSTREAM_DEGRADED_GRACE_SECS
+    }
+
+    /// Clear the upstream-outage verdict (called when a request succeeds).
+    fn clear_upstream_degraded(&self) {
+        self.upstream_degraded_since.store(0, Ordering::Release);
     }
 
     fn dispatch_without_session_pin(
@@ -359,6 +415,10 @@ where
 
         match result {
             ResultKind::Success(_) => {
+                // A real success is the upstream-recovery signal: clear any
+                // outstanding upstream-outage verdict so the next hard failure
+                // falls back to per-node dead-pool isolation.
+                self.clear_upstream_degraded();
                 self.active.release(&node_id, &result);
                 self.dispatch
                     .release_with_latency(&node_id, &result, latency_ms);
@@ -396,9 +456,22 @@ where
                     .release_with_latency(&node_id, &result, latency_ms);
             }
             ResultKind::Error { .. } => {
+                // Feed the upstream-level health detector. If multiple distinct
+                // nodes failed in a short window, this is likely an upstream
+                // outage, not a bad exit: keep the node in dispatch so follow-up
+                // requests keep hitting the upstream and succeed as soon as it
+                // recovers (no dead-pool quarantine, no recovery probe storm).
+                self.record_upstream_failure(&node_id);
                 self.active.release(&node_id, &result);
                 self.dispatch
                     .release_with_latency(&node_id, &result, latency_ms);
+                if self.upstream_degraded() {
+                    tracing::info!(
+                        node_id = %node_id,
+                        "upstream degraded: keeping node in dispatch for fast retry"
+                    );
+                    return;
+                }
                 self.dispatch.remove(&node_id);
                 if let Some(node) = self.nodes.get(&node_id) {
                     // Probe-verified rotation: in clash mode spawn_recovery_probe
@@ -904,6 +977,117 @@ mod tests {
         assert_eq!(active.available(), 0);
         assert_eq!(dead.available(), 1);
         assert_eq!(dispatch.available(), 0);
+    }
+
+    #[tokio::test]
+    async fn multi_node_failures_in_window_judge_upstream_degraded_and_keep_nodes() {
+        let dispatch = Arc::new(DispatchPool::new());
+        let active = Arc::new(ActivePool::new());
+        let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+        let dead = Arc::new(DeadPoolImpl::new());
+        let collector = Arc::new(DefaultCollector::new());
+        let manager = PoolManagerImpl::new(
+            dispatch.clone(),
+            active.clone(),
+            ratelimited,
+            dead.clone(),
+            collector,
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
+            false,
+        );
+        let node_a = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        let node_b = NodeRef::new("socks5h://user:pass@127.0.0.1:1081".to_string());
+        let node_c = NodeRef::new("socks5h://user:pass@127.0.0.1:1082".to_string());
+        for node in [&node_a, &node_b, &node_c] {
+            dispatch.add(node.clone());
+            manager.register_known_node(node.clone());
+        }
+
+        // First distinct node hard-fails: not yet degraded, so it is buried.
+        manager.report(
+            node_a.id.clone(),
+            ResultKind::Error {
+                kind: ErrorKind::SocksHandshake,
+            },
+            100,
+        );
+        assert!(!manager.upstream_degraded());
+
+        // Second distinct node hard-fails within the window -> upstream
+        // judged degraded; this node stays in dispatch (not buried).
+        manager.report(
+            node_b.id.clone(),
+            ResultKind::Error {
+                kind: ErrorKind::SocksHandshake,
+            },
+            100,
+        );
+        assert!(manager.upstream_degraded());
+        // Pool stays non-empty: node_b was kept in dispatch for fast retry.
+        assert!(dispatch.available() >= 1);
+        let meta = RequestMeta {
+            model: "deepseek-v4-flash".to_string(),
+            upstream_model: "deepseek-v4-flash-free".to_string(),
+            session_id: String::new(),
+            stream: true,
+            body_size: 128,
+            affinity_key: String::new(),
+            allow_direct_fallback: true,
+        };
+        assert!(manager.dispatch(&meta).is_ok());
+    }
+
+    #[tokio::test]
+    async fn success_after_upstream_degraded_clears_the_verdict() {
+        let dispatch = Arc::new(DispatchPool::new());
+        let active = Arc::new(ActivePool::new());
+        let ratelimited = Arc::new(RateLimitedPoolImpl::new());
+        let dead = Arc::new(DeadPoolImpl::new());
+        let collector = Arc::new(DefaultCollector::new());
+        let manager = PoolManagerImpl::new(
+            dispatch.clone(),
+            active.clone(),
+            ratelimited,
+            dead.clone(),
+            collector,
+            "https://example.invalid".to_string(),
+            "test".to_string(),
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(120),
+            false,
+        );
+        let node_a = NodeRef::new("socks5h://user:pass@127.0.0.1:1080".to_string());
+        let node_b = NodeRef::new("socks5h://user:pass@127.0.0.1:1081".to_string());
+        for node in [&node_a, &node_b] {
+            dispatch.add(node.clone());
+            manager.register_known_node(node.clone());
+        }
+
+        manager.report(
+            node_a.id.clone(),
+            ResultKind::Error {
+                kind: ErrorKind::SocksHandshake,
+            },
+            100,
+        );
+        manager.report(
+            node_b.id.clone(),
+            ResultKind::Error {
+                kind: ErrorKind::SocksHandshake,
+            },
+            100,
+        );
+        assert!(manager.upstream_degraded());
+
+        // Upstream recovers: a success clears the degraded verdict.
+        manager.report(node_b.id.clone(), ResultKind::Success(200), 50);
+
+        assert!(!manager.upstream_degraded());
     }
 
     #[test]
